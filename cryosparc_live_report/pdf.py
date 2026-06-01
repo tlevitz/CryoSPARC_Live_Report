@@ -172,13 +172,13 @@ def draw_five_plot_page(c, page_num, width, height, margin, heading, plots, note
     title_band_h = 0.04 * inch
     title_to_box_gap = 0.08 * inch
 
-    nplots = min(5, len(plots))
+    nplots = len(plots)
     avail_h = y - margin
 
     total_reserved = nplots * (title_band_h + title_to_box_gap) + (nplots - 1) * inter_block_gap
     plot_h = (avail_h - total_reserved) / float(nplots)
 
-    for i, (title, plot_img) in enumerate(plots[:5]):
+    for i, (title, plot_img) in enumerate(plots):
         # Title
         c.setFont(RL_FONT_FAMILY_BOLD, 9)
         c.drawString(margin, y - 1, title)

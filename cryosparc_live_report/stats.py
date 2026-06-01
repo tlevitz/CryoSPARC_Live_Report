@@ -21,7 +21,6 @@ from .io import (
     fmt_pct,
 )
 
-
 def workspace_attribute_limits(ws: dict, name: str) -> Tuple[Optional[float], Optional[float]]:
     mins = []
     maxs = []
@@ -34,10 +33,8 @@ def workspace_attribute_limits(ws: dict, name: str) -> Tuple[Optional[float], Op
             maxs.append(float(a["max"]))
     return (mins[0] if mins else None, maxs[0] if maxs else None)
 
-
 def get_threshold_block(ws: dict, key: str) -> dict:
     return nested_get(ws, "picking_thresholds", key) or {}
-
 
 def get_picking_threshold(ws: dict, picker_name: str = "blob_ncc_score") -> Tuple[Optional[float], Optional[float], Optional[float]]:
     d = get_threshold_block(ws, picker_name)
@@ -108,6 +105,41 @@ def build_class2d_info_map(ws: dict) -> Dict[int, dict]:
         out[idx] = row
     return out
 
+def summarize_abinit_info(ws: dict) -> Dict[str, int]:
+    info = ws.get("phase2_abinit_info") or []
+    selected_volumes = 0
+    rejected_volumes = 0
+    selected_particles = 0
+    rejected_particles = 0
+
+    for row in info:
+        is_selected = bool(row.get("selected"))
+        n = int(row.get("num_particles") or 0)
+
+        if is_selected:
+            selected_volumes += 1
+            selected_particles += n
+        else:
+            rejected_volumes += 1
+            rejected_particles += n
+
+    return {
+        "total_volumes": len(info),
+        "selected_volumes": selected_volumes,
+        "rejected_volumes": rejected_volumes,
+        "selected_particles": selected_particles,
+        "rejected_particles": rejected_particles,
+    }
+
+
+def refine_status_label(ws: dict) -> str:
+    if ws.get("phase2_refine_ready"):
+        return "Ready"
+    if ws.get("phase2_refine_ready_partial"):
+        return "Partial"
+    if ws.get("phase2_refine_job"):
+        return "Started"
+    return ""
 
 def is_rejected_exp(exp: dict) -> bool:
     return bool(exp.get("manual_reject")) or bool(exp.get("threshold_reject"))
@@ -219,7 +251,6 @@ def exposure_start_dt(exp: dict):
             return val
     return None
 
-
 def exposure_end_dt(exp: dict):
     attr = exp.get("attributes", {})
     for k in ("ready_at", "extract_at", "pick_at", "ctf_at", "motion_at"):
@@ -231,6 +262,11 @@ def exposure_end_dt(exp: dict):
         return val
     return None
 
+def get_ice_thickness_rel(exp: dict) -> Optional[float]:
+    try:
+        return float(nested_get(exp, "attributes", "ice_thickness_rel"))
+    except Exception:
+        return None
 
 def choose_pick_cs_path(project_dir: str, exp: dict) -> Tuple[Optional[str], Optional[str]]:
     """
@@ -498,6 +534,7 @@ def parse_exposure(project_dir: str, session_name: str, exp: dict, bin_size_pix:
         "defocus_um": get_avg_defocus_um(exp),
         "total_motion_pix": get_total_motion(exp),
         "max_inframe_motion": get_max_inframe_motion(exp),
+        "ice_thickness_rel": get_ice_thickness_rel,
         "blob_picks": get_blob_picks(exp),
         "active_pick_count": get_active_pick_count(exp),
         "extracted_particles": get_extracted_particles(exp),
@@ -551,7 +588,14 @@ def select_accepted_ctf_tertiles(parsed: List[dict], n_each: int = 5) -> Dict[st
 
     thirds = np.array_split(np.array(accepted, dtype=object), 3)
     labels = ["best", "middle", "worst"]
-    return {label: evenly_sample(list(arr), n_each) for label, arr in zip(labels, thirds)}
+
+    out = {}
+    for label, arr in zip(labels, thirds):
+        sampled = evenly_sample(list(arr), n_each)
+        sampled.sort(key=lambda e: e.get("exposure_number", float("inf")))
+        out[label] = sampled
+
+    return out
 
 def select_rejected_random(parsed: List[dict], n: int, seed_str: str) -> List[dict]:
     rejected = [e for e in parsed if e.get("rejected") and e.get("thumb_path")]
@@ -586,6 +630,7 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
     ctf_best, ctf_med, ctf_worst = summarize_vals(parsed, "ctf_fit_A")
     _mot_best, mot_med, _mot_worst = summarize_vals(parsed, "max_inframe_motion")
     class2d = summarize_class2d_info(ws)
+    abinit = summarize_abinit_info(ws)
 
     current_picker = str(params.get("current_picker") or "").strip().lower()
 
@@ -612,9 +657,9 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
         f'&nbsp;&nbsp;&nbsp;'
         f'<font color="#de2d26"><b>Rejected:</b> {total_rejected}</font>'
         f'&nbsp;&nbsp;&nbsp;'
-        f'<font color="#636363"><b>Failed:</b> {total_failed}</font>'
+        f'<font color="#756bb1"><b>Failed:</b> {total_failed}</font>'
         f'&nbsp;&nbsp;&nbsp;'
-        f'<font color="#756bb1"><b>Acceptance:</b> {fmt_pct(total_accepted, total_exposures, 1)}</font>'
+        f'<font color="#dd1c77"><b>Acceptance:</b> {fmt_pct(total_accepted, total_exposures, 0)}</font>'
     )
 
     session_rows = [
@@ -622,7 +667,7 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
         ("Project Title", str(project.get("title", ""))),
         ("Project UID", str(project.get("uid", ""))),
         ("CryoSPARC Version", str(project.get("last_dumped_version", ""))),
-        ("Session", str(ws.get("session_uid") or ws.get("session_dir") or "")),
+#        ("Session", str(ws.get("session_uid") or ws.get("session_dir") or "")),
         ("Workspace UID", str(ws.get("uid", ""))),
         ("Workspace Title", str(ws.get("title", ""))),
 #        ("Workspace Status", str(ws.get("status", ""))),
@@ -637,8 +682,10 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
 #        ("Total Failed", str(total_failed)),
 #        ("Acceptance Rate", fmt_pct(total_accepted, total_exposures, 1)),
     ]
+    
+    session_uid = str(ws.get("session_uid") or ws.get("session_dir") or "")
     sections.append({
-        "title": "Session Overview",
+        "title": f"Session Overview - {session_uid}",
         "summary_html": session_summary_html,
         "rows": session_rows,
     })
@@ -661,15 +708,15 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
         ("Acceleration Voltage (kV)", fmt_num(params.get("accel_kv"), 1)),
         ("Spherical Aberration (mm)", fmt_num(params.get("cs_mm"), 2)),
 #        ("Total Dose (e/A2)", fmt_num(params.get("total_dose_e_per_A2"), 1)),
-        ("CTF Resolution Min (A)", fmt_num(params.get("ctf_res_min_align"), 1)),
-        ("CTF Resolution Max (A)", fmt_num(params.get("ctf_res_max_align"), 1)),
+#        ("CTF Resolution Min (A)", fmt_num(params.get("ctf_res_min_align"), 1)),
+#        ("CTF Resolution Max (A)", fmt_num(params.get("ctf_res_max_align"), 1)),
         ("Best CTF Fit (A)", fmt_num(ctf_best, 2) if ctf_best is not None else ""),
         ("Median CTF Fit (A)", fmt_num(ctf_med, 2) if ctf_med is not None else ""),
         ("Worst CTF Fit (A)", fmt_num(ctf_worst, 2) if ctf_worst is not None else ""),
-        ("Median Max In-Frame Motion", fmt_num(mot_med, 3) if mot_med is not None else ""),
+#        ("Median Max In-Frame Motion", fmt_num(mot_med, 3) if mot_med is not None else ""),
     ]
     sections.append({
-        "title": "Acquisition / Imaging",
+        "title": "Acquisition + Imaging",
         "summary_html": imaging_summary_html,
         "rows": imaging_rows,
     })
@@ -693,7 +740,7 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
         f'&nbsp;&nbsp;&nbsp;'
         f'<font color="#756bb1"><b>Extracted:</b> {stats.get("total_extracted_particles", "")}</font>'
         f'&nbsp;&nbsp;&nbsp;'
-        f'<font color="#dd1c77"><b>Avg/Mic:</b> {fmt_num(stats.get("avg_particles_extracted_per_mic"), 1)}</font>'
+        f'<font color="#dd1c77"><b>Avg/Mic:</b> {fmt_num(stats.get("avg_particles_extracted_per_mic"), 0)}</font>'
     )
 
     picking_rows = [
@@ -717,19 +764,19 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
         ])
     elif current_picker == "template":
         template_creation_job = str(ws.get("template_creation_job", ""))
-        template_creation_project = ("Template Creation Project", str(ws.get("template_creation_project", "")))
+        template_creation_project = str(ws.get("template_creation_project", ""))
 
         picking_rows.extend([
             ("Template Source", f"{template_creation_project} {template_creation_job}"),
+            ("Template Lowpass (A)", fmt_num(params.get("template_lowpass_res"), 1)),
+#            ("Template Angular Spacing (deg)", fmt_num(params.get("template_angular_spacing_deg"), 1)),
+            ("Template Max Num Hits", str(params.get("template_max_num_hits", ""))),
             ("Template Min Separation (diameters)", fmt_num(params.get("template_min_distance"), 2)),
             ("Template NCC Threshold Value", fmt_num(ncc_val, 3)),
 #            ("Template NCC Threshold Min", fmt_num(ncc_min, 3)),
 #            ("Template NCC Threshold Max", fmt_num(ncc_max, 3)),
             ("Template Power Min", fmt_num(power_min, 3)),
             ("Template Power Max", fmt_num(power_max, 3)),
-            ("Template Lowpass (A)", fmt_num(params.get("template_lowpass_res"), 1)),
-#            ("Template Angular Spacing (deg)", fmt_num(params.get("template_angular_spacing_deg"), 1)),
-            ("Template Max Num Hits", str(params.get("template_max_num_hits", ""))),
             ("Total Template Picks", str(stats.get("total_template_picks", ""))),
         ])
     elif current_picker == "deep":
@@ -748,12 +795,20 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
 #    ])
 
     sections.append({
-        "title": "Picking / Extraction",
+        "title": "Picking + Extraction",
         "summary_html": picking_summary_html,
         "rows": picking_rows,
     })
 
     # ---------------- 2D Classification ----------------
+
+    total_2d_accepted = str(ws.get("phase2_class2D_num_particles_accepted", ""))
+    total_2d = str(ws.get("phase2_class2D_num_particles_in", ""))
+
+    selected_2d_particles = str(class2d["selected_particles"])
+    rejected_2d_particles = str(class2d["selected_particles"])
+    total_classified = (selected_2d_particles + rejected_2d_particles)
+
     class2d_summary_html = (
         f'<font color="#3182bd"><b>Classes:</b> {class2d["total_classes"]}</font>'
         f'&nbsp;&nbsp;&nbsp;'
@@ -762,10 +817,12 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
         f'<font color="#de2d26"><b>Rejected:</b> {class2d["rejected_classes"]}</font>'
         f'&nbsp;&nbsp;&nbsp;'
         f'<font color="#756bb1"><b>Particles Accepted:</b> {ws.get("phase2_class2D_num_particles_accepted", "")}</font>'
+        f'&nbsp;&nbsp;&nbsp;'
+        f'<font color="#dd1c77"><b>Acceptance:</b> {fmt_pct(total_2d_accepted, total_classified, 0)}</font>'
     )
     
     class2d_rows = [
-        ("Selected 2D Class Job", class_job_uid or ""),
+#        ("Selected 2D Class Job", class_job_uid or ""),
         ("2D Class Max Resolution (A)", fmt_num(get_class2d_param(class_job_uid, ws, "class2D_max_res"), 1)),
     ]
 
@@ -775,9 +832,9 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
 
     class2d_rows.extend([
         ("2D Window Inner (A)", fmt_num(window_inner_A, 1)),
-        ("2D Particles In", str(ws.get("phase2_class2D_num_particles_in", ""))),
-        ("2D Particles Accepted", str(ws.get("phase2_class2D_num_particles_accepted", ""))),
-        ("2D Particles Rejected", str(ws.get("phase2_class2D_num_particles_rejected", ""))),
+        ("Particles Classified", total_classified),
+#        ("2D Particles Accepted", str(ws.get("phase2_class2D_num_particles_accepted", ""))),
+#        ("2D Particles Rejected", str(ws.get("phase2_class2D_num_particles_rejected", ""))),
         ("2D Last Updated", fmt_dt(json_date_to_dt(ws.get("phase2_class2D_last_updated")))),
 #        ("2D Class K", str(nested_get(ws, "phase2_class2D_params_spec_used", "class2D_K") or "")),
 #        ("2D Classes Total", str(class2d["total_classes"])),
@@ -788,10 +845,92 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
     ])
 
     sections.append({
-        "title": "2D Classification",
+        "title": f"2D Classification - {class_job_uid}",
         "summary_html": class2d_summary_html,
         "rows": class2d_rows,
     })
+
+    # ---------------- Ab-initio Reconstruction ----------------
+    abinit_job = ws.get("phase2_abinit_job")
+    abinit_info = ws.get("phase2_abinit_info") or []
+    has_abinit = bool(abinit_job) or bool(abinit_info) or bool(ws.get("phase2_abinit_ready"))
+
+    if has_abinit:
+        abinit_symmetry = nested_get(ws, "phase2_abinit_params_spec", "abinit_symmetry")
+        abinit_K = nested_get(ws, "phase2_abinit_params_spec", "abinit_K")
+        abinit_num_particles = nested_get(ws, "phase2_abinit_params_spec", "abinit_num_particles")
+
+        abinit_summary_html = (
+            f'<font color="#3182bd"><b>Volumes:</b> {abinit["total_volumes"]}</font>'
+            f'&nbsp;&nbsp;&nbsp;'
+            f'<font color="#2ca25f"><b>Selected:</b> {abinit["selected_volumes"]}</font>'
+#            f'&nbsp;&nbsp;&nbsp;'
+#            f'<font color="#de2d26"><b>Rejected:</b> {abinit["rejected_volumes"]}</font>'
+            f'&nbsp;&nbsp;&nbsp;'
+            f'<font color="#756bb1"><b>Symmetry:</b> {str(abinit_symmetry or "")}</font>'
+        )
+
+        abinit_rows = [
+#            ("Ab-initio Job", str(abinit_job or "")),
+#            ("Ab-initio Ready", str(ws.get("phase2_abinit_ready", ""))),
+#            ("Ab-initio Restart", str(ws.get("phase2_abinit_restart", ""))),
+#            ("Ab-initio Symmetry", str(abinit_symmetry or "")),
+#            ("Ab-initio Number of Classes", str(abinit_K or "")),
+#            ("Ab-initio Target Particles", str(abinit_num_particles or "")),
+            ("Ab-initio Particles In", str(ws.get("phase2_abinit_num_particles_in", ""))),
+#            ("Ab-initio Volumes Total", str(abinit["total_volumes"])),
+#            ("Ab-initio Volumes Selected", str(abinit["selected_volumes"])),
+#            ("Ab-initio Volumes Rejected", str(abinit["rejected_volumes"])),
+            ("Ab-initio Particles in Selected Volumes", str(abinit["selected_particles"])),
+#            ("Ab-initio Particles in Rejected Volumes", str(abinit["rejected_particles"])),
+        ]
+
+        sections.append({
+            "title": f"Ab-initio Reconstruction - {abinit_job}",
+            "summary_html": abinit_summary_html,
+            "rows": abinit_rows,
+        })
+
+    # ---------------- Homogeneous Refinement ----------------
+    refine_job = ws.get("phase2_refine_job")
+    has_refine = (
+        bool(refine_job)
+        or bool(ws.get("phase2_refine_ready"))
+        or bool(ws.get("phase2_refine_ready_partial"))
+        or bool(ws.get("phase2_refine_num_particles_in"))
+        or bool(ws.get("phase2_refine_last_updated"))
+    )
+
+    if has_refine:
+        refine_symmetry = (
+            nested_get(ws, "phase2_refine_params_spec_used", "refine_symmetry")
+            or nested_get(ws, "phase2_refine_params_spec", "refine_symmetry")
+        )
+
+        refine_summary_html = (
+#            f'<font color="#3182bd"><b>Job:</b> {refine_job or ""}</font>'
+            f'<font color="#3182bd"><b>Particles In:</b> {ws.get("phase2_refine_num_particles_in", "")}</font>'
+            f'&nbsp;&nbsp;&nbsp;'
+            f'<font color="#2ca25f"><b>Status:</b> {refine_status_label(ws)}</font>'
+            f'&nbsp;&nbsp;&nbsp;'
+            f'<font color="#756bb1"><b>Symmetry:</b> {str(refine_symmetry or "")}</font>'
+            f'&nbsp;&nbsp;&nbsp;'
+        )
+
+        refine_rows = [
+#            ("Homogeneous Refinement Job", str(refine_job or "")),
+#            ("Homogeneous Refinement Status", refine_status_label(ws)),
+#            ("Homogeneous Refinement Restart", str(ws.get("phase2_refine_restart", ""))),
+#            ("Homogeneous Refinement Symmetry", str(refine_symmetry or "")),
+            ("Homogeneous Refinement Particles In", str(ws.get("phase2_refine_num_particles_in", ""))),
+            ("Homogeneous Refinement Last Updated", fmt_dt(json_date_to_dt(ws.get("phase2_refine_last_updated")))),
+        ]
+
+        sections.append({
+            "title": f"Homogeneous Refinement - {refine_job}",
+            "summary_html": refine_summary_html,
+            "rows": refine_rows,
+        })
 
     return sections
 

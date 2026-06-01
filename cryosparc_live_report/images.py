@@ -1419,16 +1419,16 @@ def plot_ctf_defocus_landscape_to_pil(
         except Exception:
             pass
 
-        if cfg["colorbar"]:
-            cbar = fig.colorbar(
-                surf,
-                ax=ax,
-                shrink=cfg["colorbar_shrink"],
-                pad=cfg["colorbar_pad"],
-                fraction=cfg["colorbar_fraction"],
-            )
-            cbar.ax.tick_params(labelsize=cfg["tick_labelsize"])
-            cbar.set_label(cfg["colorbar_label"], fontsize=cfg["colorbar_label_fontsize"])
+#        if cfg["colorbar"]:
+#            cbar = fig.colorbar(
+#                surf,
+#                ax=ax,
+#                shrink=cfg["colorbar_shrink"],
+#                pad=cfg["colorbar_pad"],
+#                fraction=cfg["colorbar_fraction"],
+#            )
+#            cbar.ax.tick_params(labelsize=cfg["tick_labelsize"])
+#            cbar.set_label(cfg["colorbar_label"], fontsize=cfg["colorbar_label_fontsize"])
 
         fig.tight_layout(pad=cfg["tight_pad"])
         return mplfig_to_pil(fig)

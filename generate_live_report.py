@@ -157,6 +157,19 @@ def build_report(project_dir: str, session_name: str = "S1") -> int:
     try:
         parsed = [parse_exposure(project_dir, session_name, exp, bin_size_pix) for exp in exposures]
         parsed = assign_exposure_numbers(parsed)
+        
+        start_times = [e.get("start_dt") for e in parsed if e.get("start_dt") is not None]
+        if start_times:
+            t0 = min(start_times)
+            for e in parsed:
+                dt = e.get("start_dt")
+                if dt is not None:
+                    e["elapsed_minutes"] = (dt - t0).total_seconds() / 60.0
+                else:
+                    e["elapsed_minutes"] = None
+
+        ("elapsed_minutes", "Time Since Start (min)", "Time Since Start (min)", None, None, False),
+
     except Exception as e:
         print(f"Error: failed to parse exposure metadata: {e}")
         return 2

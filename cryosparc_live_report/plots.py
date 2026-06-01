@@ -42,16 +42,16 @@ def render_single_scatterplot(
 
     # Marker sizes reduced roughly by half
     if pts["accepted"][0]:
-        ax.scatter(pts["accepted"][0], pts["accepted"][1], s=4, alpha=0.7, c="#2c7fb8", label="accepted")
+        ax.scatter(pts["accepted"][0], pts["accepted"][1], s=4, alpha=0.7, c="#0000ff", label="accepted")
     if pts["rejected"][0]:
-        ax.scatter(pts["rejected"][0], pts["rejected"][1], s=5, alpha=0.8, c="#d95f0e", label="rejected")
+        ax.scatter(pts["rejected"][0], pts["rejected"][1], s=5, alpha=0.8, c="#de2d26", label="rejected")
     if pts["other"][0]:
         ax.scatter(pts["other"][0], pts["other"][1], s=4, alpha=0.5, c="#888888", label="other")
 
     if y_min_line is not None:
-        ax.axhline(float(y_min_line), color="#31a354", linestyle="--", linewidth=1)
+        ax.axhline(float(y_min_line), color="#48494B", linestyle="--", linewidth=1)
     if y_max_line is not None:
-        ax.axhline(float(y_max_line), color="#de2d26", linestyle="--", linewidth=1)
+        ax.axhline(float(y_max_line), color="#48494B", linestyle="--", linewidth=1)
 
     # No internal title; PDF adds the title above each plot
     ax.set_xlabel("Exposure number", fontsize=8)
@@ -63,7 +63,7 @@ def render_single_scatterplot(
         ax.set_yticks([0, 1])
         ax.set_yticklabels(["Rejected", "Accepted"])
 
-    ax.legend(loc="upper right", fontsize=6)
+#    ax.legend(loc="upper right", fontsize=6)
     fig.tight_layout(pad=0.5)
 
     buf = BytesIO()
@@ -74,17 +74,22 @@ def render_single_scatterplot(
 
 
 def build_scatterplots(parsed: List[dict], ws: dict) -> List[Tuple[str, Image.Image]]:
+    time_min, time_max = workspace_attribute_limits(ws, "elapsed_minutes")
     ctf_min, ctf_max = workspace_attribute_limits(ws, "ctf_fit_to_A")
-    motion_min, motion_max = workspace_attribute_limits(ws, "max_intra_frame_motion")
-    part_min, part_max = workspace_attribute_limits(ws, "total_extracted_particles")
     defocus_min, defocus_max = workspace_attribute_limits(ws, "average_defocus")
+    motion_min, motion_max = workspace_attribute_limits(ws, "max_intra_frame_motion")
+    total_motion_min, total_motion_max = workspace_attribute_limits(ws, "total_motion_dist")
+    ice_min, ice_max = workspace_attribute_limits(ws, "ice_thickness_rel")
+    part_min, part_max = workspace_attribute_limits(ws, "total_extracted_particles")
 
     plot_specs = [
+        ("elapsed_minutes", "Time Since Start (min)", "Time Since Start (min)", time_min, time_max, False),
         ("ctf_fit_A", "CTF Fit (Å)", "CTF Fit (Å)", ctf_min, ctf_max, False),
         ("defocus_A", "Defocus Avg (Å)", "Defocus Avg (Å)", defocus_min, defocus_max, False),
         ("max_inframe_motion", "Max In-Frame Motion", "Max In-Frame Motion", motion_min, motion_max, False),
+        ("total_motion_pix", "Total Motion (px)", "Total Motion (px)", total_motion_min, total_motion_max, False),
+        ("ice_thickness_rel", "Relative Ice Thickness", "Relative Ice Thickness", ice_min, ice_max, False),
         ("extracted_particles", "Total Particles Extracted", "Particles Extracted", part_min, part_max, False),
-        ("status_binary", "Exposure Acceptance State", "Status", None, None, True),
     ]
 
     plots = []
@@ -101,4 +106,3 @@ def build_scatterplots(parsed: List[dict], ws: dict) -> List[Tuple[str, Image.Im
             plots.append((title, img))
 
     return plots
-
