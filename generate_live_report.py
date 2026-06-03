@@ -168,8 +168,6 @@ def build_report(project_dir: str, session_name: str = "S1") -> int:
                 else:
                     e["elapsed_minutes"] = None
 
-        ("elapsed_minutes", "Time Since Start (min)", "Time Since Start (min)", None, None, False),
-
     except Exception as e:
         print(f"Error: failed to parse exposure metadata: {e}")
         return 2

@@ -534,7 +534,7 @@ def parse_exposure(project_dir: str, session_name: str, exp: dict, bin_size_pix:
         "defocus_um": get_avg_defocus_um(exp),
         "total_motion_pix": get_total_motion(exp),
         "max_inframe_motion": get_max_inframe_motion(exp),
-        "ice_thickness_rel": get_ice_thickness_rel,
+        "ice_thickness_rel": get_ice_thickness_rel(exp),
         "blob_picks": get_blob_picks(exp),
         "active_pick_count": get_active_pick_count(exp),
         "extracted_particles": get_extracted_particles(exp),
@@ -662,15 +662,17 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
         f'<font color="#dd1c77"><b>Acceptance:</b> {fmt_pct(total_accepted, total_exposures, 0)}</font>'
     )
 
+    project_uid = str(project.get("uid", ""))
+    ws_uid = str(ws.get("uid", ""))
+
     session_rows = [
-        ("Project Folder", project.get("project_dir", "").rstrip("/").split("/")[-1]),
+#        ("Project Folder", project.get("project_dir", "").rstrip("/").split("/")[-1]),
         ("Project Title", str(project.get("title", ""))),
-        ("Project UID", str(project.get("uid", ""))),
-        ("CryoSPARC Version", str(project.get("last_dumped_version", ""))),
+        ("Project + Workspace UID", f"{project_uid} {ws_uid}"),
 #        ("Session", str(ws.get("session_uid") or ws.get("session_dir") or "")),
-        ("Workspace UID", str(ws.get("uid", ""))),
         ("Workspace Title", str(ws.get("title", ""))),
 #        ("Workspace Status", str(ws.get("status", ""))),
+        ("CryoSPARC Version", str(project.get("last_dumped_version", ""))),
         ("Start Time", fmt_dt(start_dt)),
         ("End Time", fmt_dt(end_dt)),
         ("Total Time (hrs)", fmt_num(dur, 2) if dur is not None else ""),
@@ -922,7 +924,7 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
 #            ("Homogeneous Refinement Status", refine_status_label(ws)),
 #            ("Homogeneous Refinement Restart", str(ws.get("phase2_refine_restart", ""))),
 #            ("Homogeneous Refinement Symmetry", str(refine_symmetry or "")),
-            ("Homogeneous Refinement Particles In", str(ws.get("phase2_refine_num_particles_in", ""))),
+#            ("Homogeneous Refinement Particles In", str(ws.get("phase2_refine_num_particles_in", ""))),
             ("Homogeneous Refinement Last Updated", fmt_dt(json_date_to_dt(ws.get("phase2_refine_last_updated")))),
         ]
 

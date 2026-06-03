@@ -74,7 +74,6 @@ def render_single_scatterplot(
 
 
 def build_scatterplots(parsed: List[dict], ws: dict) -> List[Tuple[str, Image.Image]]:
-    time_min, time_max = workspace_attribute_limits(ws, "elapsed_minutes")
     ctf_min, ctf_max = workspace_attribute_limits(ws, "ctf_fit_to_A")
     defocus_min, defocus_max = workspace_attribute_limits(ws, "average_defocus")
     motion_min, motion_max = workspace_attribute_limits(ws, "max_intra_frame_motion")
@@ -83,7 +82,7 @@ def build_scatterplots(parsed: List[dict], ws: dict) -> List[Tuple[str, Image.Im
     part_min, part_max = workspace_attribute_limits(ws, "total_extracted_particles")
 
     plot_specs = [
-        ("elapsed_minutes", "Time Since Start (min)", "Time Since Start (min)", time_min, time_max, False),
+        ("elapsed_minutes", "Time Since Start (min)", "Time Since Start (min)", None, None, False),
         ("ctf_fit_A", "CTF Fit (Å)", "CTF Fit (Å)", ctf_min, ctf_max, False),
         ("defocus_A", "Defocus Avg (Å)", "Defocus Avg (Å)", defocus_min, defocus_max, False),
         ("max_inframe_motion", "Max In-Frame Motion", "Max In-Frame Motion", motion_min, motion_max, False),
