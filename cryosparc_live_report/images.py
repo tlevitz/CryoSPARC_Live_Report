@@ -16,6 +16,7 @@ from matplotlib.colors import PowerNorm
 from matplotlib.patches import Rectangle
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from scipy.ndimage import map_coordinates
+from skimage.filters import butterworth
 
 try:
     from cryosparc.tools import Dataset
@@ -1451,58 +1452,157 @@ def normalize_curve_01(arr: np.ndarray) -> np.ndarray:
     out = (a - lo) / max(hi - lo, 1e-8)
     return np.clip(out, 0.0, 1.0)
 
+def particle_lowpass_for_display(img: np.ndarray) -> np.ndarray:
+    """
+    Match the recommended particle-display style:
+      - low-pass with scikit-image Butterworth
+      - cutoff_frequency_ratio = 6 / N
+      - order = 1
+    """
+    a = np.asarray(img, dtype=np.float32)
+    a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
 
-def load_particle_stack_montage(
+    if a.ndim != 2:
+        raise ValueError(f"Expected 2D particle image, got shape {a.shape}")
+
+    if butterworth is None:
+        return a
+
+    N = int(a.shape[0])
+    if N <= 0:
+        return a
+
+    out = butterworth(
+        a,
+        cutoff_frequency_ratio=6.0 / float(N),
+        high_pass=False,
+        order=1,
+    )
+    return np.asarray(out, dtype=np.float32)
+
+def _particle_imshow_kwargs(
+    img: np.ndarray,
+    invert: bool = False,
+    autoscale: str = "imshow",   # "imshow", "minmax", or "percentile"
+    p_lo: float = 0.5,
+    p_hi: float = 99.5,
+):
+    cmap = "gray_r" if invert else "gray"
+
+    autoscale = (autoscale or "imshow").lower()
+    if autoscale in ("imshow", "minmax"):
+        return {"cmap": cmap}
+
+    if autoscale == "percentile":
+        lo = float(np.percentile(img, p_lo))
+        hi = float(np.percentile(img, p_hi))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            return {"cmap": cmap}
+        return {"cmap": cmap, "vmin": lo, "vmax": hi}
+
+    raise ValueError(f"Unknown autoscale mode: {autoscale}")
+
+
+def load_particle_stack_montage_matplotlib(
     stack_path: str,
-    sample_n: int = 36,
-    cols: int = 6,
-    tile_size: int = 96,
-    render_kwargs: Optional[dict] = None,
+    sample_n: int = 12,
+    cols: int = 4,
+    tile_inches: float = 2.0,
+    dpi: int = 100,
+    invert: bool = False,
+    autoscale: str = "imshow",   # "imshow", "minmax", or "percentile"
+    p_lo: float = 0.5,
+    p_hi: float = 99.5,
+    wspace: float = 0.1,
+    hspace: float = 0.1,
+    add_indices: bool = False,
 ) -> Optional[Image.Image]:
-    render_kwargs = render_kwargs or {}
+    """
+    Render a particle montage using Matplotlib subplots, with display matched
+    more closely to the recommended Butterworth-filtered imshow style.
+    """
+    try:
+        arr = load_mrc(stack_path)
+        arr = normalize_stack(arr)
 
-    arr = load_mrc(stack_path)
-    arr = normalize_stack(arr)
-    if arr.ndim != 3:
+        if arr.ndim != 3 or arr.shape[0] == 0:
+            return None
+
+        idxs = sample_indices_evenly(arr.shape[0], sample_n)
+        if not idxs:
+            return None
+
+        cols = max(1, int(cols))
+        rows = int(math.ceil(len(idxs) / cols))
+
+        fig, axs = plt.subplots(
+            rows,
+            cols,
+            figsize=(cols * tile_inches, rows * tile_inches),
+            dpi=dpi,
+            squeeze=False,
+        )
+        fig.patch.set_facecolor("white")
+        plt.subplots_adjust(wspace=wspace, hspace=hspace)
+
+        flat_axes = axs.ravel()
+
+        for ax in flat_axes:
+            ax.axis("off")
+
+        for k, idx in enumerate(idxs):
+            img = particle_lowpass_for_display(arr[idx])
+            kw = _particle_imshow_kwargs(
+                img,
+                invert=invert,
+                autoscale=autoscale,
+                p_lo=p_lo,
+                p_hi=p_hi,
+            )
+
+            flat_axes[k].imshow(img, origin="upper", **kw)
+
+            if add_indices:
+                flat_axes[k].text(
+                    0.03,
+                    0.97,
+                    str(idx),
+                    transform=flat_axes[k].transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=8,
+                    color="yellow",
+                    bbox=dict(facecolor="black", alpha=0.35, pad=1.5, edgecolor="none"),
+                )
+
+        return mplfig_to_pil(fig)
+
+    except Exception as e:
+        print(f"Warning: failed particle montage for {stack_path}: {e}")
         return None
 
-    n = arr.shape[0]
-    idxs = sample_indices_evenly(n, sample_n)
-    rows = int(math.ceil(len(idxs) / cols))
-    gap = 6
-    top = 8
-    W = cols * tile_size + (cols + 1) * gap
-    H = rows * tile_size + (rows + 1) * gap + top
-
-    canvas = Image.new("RGB", (W, H), "white")
-
-    for k, idx in enumerate(idxs):
-        r = k // cols
-        c = k % cols
-        tile = arr2d_signed_to_pil(arr[idx], **render_kwargs).convert("RGB")
-        tile = fit_within(tile, tile_size, tile_size)
-
-        x = gap + c * (tile_size + gap) + (tile_size - tile.width) // 2
-        y = top + gap + r * (tile_size + gap) + (tile_size - tile.height) // 2
-        canvas.paste(tile, (x, y))
-
-    return canvas
-
-
-def load_particle_multi_stack_montage(
+def load_particle_multi_stack_montage_matplotlib(
     stack_paths: List[str],
     row_labels: Optional[List[str]] = None,
     per_stack: int = 6,
     max_stacks: int = 6,
-    tile_size: int = 96,
-    label_width: int = 240,
-    lowpass_A: Optional[float] = 20.0,
-    target_display_angpix: float = 3.0,
-    soft_sigma: float = 3.0,
-    output_lo: int = 45,
-    output_hi: int = 210,
+    tile_inches: float = 1.8,
+    dpi: int = 100,
     invert: bool = False,
+    autoscale: str = "imshow",   # "imshow", "minmax", or "percentile"
+    p_lo: float = 0.5,
+    p_hi: float = 99.5,
+    wspace: float = 0.08,
+    hspace: float = 0.08,
+    left_margin: float = 0.14,
+    add_indices: bool = False,
 ) -> Optional[Image.Image]:
+    """
+    Render multiple particle stacks as a Matplotlib montage:
+      - one row per stack
+      - Butterworth low-pass particle display
+      - row labels on the left
+    """
     row_labels = row_labels or []
     rows_data = []
 
@@ -1510,47 +1610,16 @@ def load_particle_multi_stack_montage(
         try:
             arr = load_mrc(stack_path)
             arr = normalize_stack(arr)
+
             if arr.ndim != 3 or arr.shape[0] == 0:
                 continue
 
-            stack_angpix = get_mrc_voxel_size_A(stack_path)
-            bin_factor = choose_display_bin_factor(
-                stack_angpix,
-                target_angpix=target_display_angpix,
-                max_bin=4,
-            )
-
             idxs = sample_indices_evenly(arr.shape[0], per_stack)
-            tiles = []
-
-            for idx in idxs:
-                img2d = np.asarray(arr[idx], dtype=np.float32)
-                img2d = np.nan_to_num(img2d, nan=0.0, posinf=0.0, neginf=0.0)
-
-                if lowpass_A is not None and stack_angpix is not None:
-                    img2d = lowpass_filter_2d(img2d, cutoff_A=lowpass_A, angpix=stack_angpix)
-
-                if bin_factor > 1:
-                    img2d = bin_mean(img2d, bin_factor)
-
-                tile = arr2d_signed_soft_to_pil(
-                    img2d,
-                    invert=invert,
-                    sigma=soft_sigma,
-                    output_lo=output_lo,
-                    output_hi=output_hi,
-                    center_on_zero=False,
-                ).convert("RGB")
-
-                tile = fit_within(tile, tile_size, tile_size)
-                tile = pad_tile_to_square(tile, tile_size, bg="white")
-                tiles.append(tile)
-
-            if not tiles:
+            if not idxs:
                 continue
 
             label = row_labels[i] if i < len(row_labels) else f"Stack {i+1}"
-            rows_data.append((label, tiles))
+            rows_data.append((label, arr, idxs))
 
         except Exception as e:
             print(f"Warning: failed particle stack {stack_path}: {e}")
@@ -1561,41 +1630,70 @@ def load_particle_multi_stack_montage(
         return None
 
     n_rows = len(rows_data)
-    n_cols = max(len(tiles) for _, tiles in rows_data)
-    gap = 6
-    top = 8
+    n_cols = max(len(idxs) for _, _, idxs in rows_data)
 
-    W = label_width + (n_cols * tile_size) + ((n_cols + 1) * gap)
-    H = top + (n_rows * tile_size) + ((n_rows + 1) * gap)
+    fig, axs = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(n_cols * tile_inches, n_rows * tile_inches),
+        dpi=dpi,
+        squeeze=False,
+    )
+    fig.patch.set_facecolor("white")
+    plt.subplots_adjust(
+        left=left_margin,
+        right=0.99,
+        top=0.99,
+        bottom=0.01,
+        wspace=wspace,
+        hspace=hspace,
+    )
 
-    canvas = Image.new("RGB", (W, H), "white")
-    draw = ImageDraw.Draw(canvas)
-    font = load_font(14, bold=False)
+    for r in range(n_rows):
+        label, arr, idxs = rows_data[r]
 
-    for r, (label, tiles) in enumerate(rows_data):
-        y = top + gap + r * (tile_size + gap)
+        for c in range(n_cols):
+            ax = axs[r, c]
+            ax.axis("off")
 
-        try:
-            bbox = draw.multiline_textbbox((0, 0), label, font=font, spacing=2)
-            text_h = bbox[3] - bbox[1]
-        except Exception:
-            text_h = 28
+            if c < len(idxs):
+                idx = idxs[c]
+                img = particle_lowpass_for_display(arr[idx])
+                kw = _particle_imshow_kwargs(
+                    img,
+                    invert=invert,
+                    autoscale=autoscale,
+                    p_lo=p_lo,
+                    p_hi=p_hi,
+                )
+                ax.imshow(img, origin="upper", **kw)
 
-        text_y = y + (tile_size - text_h) // 2
-        draw.multiline_text(
-            (8, text_y),
+                if add_indices:
+                    ax.text(
+                        0.03,
+                        0.97,
+                        str(idx),
+                        transform=ax.transAxes,
+                        ha="left",
+                        va="top",
+                        fontsize=7,
+                        color="yellow",
+                        bbox=dict(facecolor="black", alpha=0.35, pad=1.2, edgecolor="none"),
+                    )
+
+        # Put row label on the first axis in the row
+        axs[r, 0].text(
+            -0.08,
+            0.5,
             label,
-            fill=(0, 0, 0),
-            font=font,
-            spacing=2,
-            align="left",
+            transform=axs[r, 0].transAxes,
+            ha="right",
+            va="center",
+            fontsize=10,
+            color="black",
         )
 
-        for c, tile in enumerate(tiles):
-            x = label_width + gap + c * (tile_size + gap)
-            canvas.paste(tile, (x, y))
-
-    return canvas
+    return mplfig_to_pil(fig)
 
 
 def make_classavg_montages(

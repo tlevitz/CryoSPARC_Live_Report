@@ -808,7 +808,7 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
     total_2d = str(ws.get("phase2_class2D_num_particles_in", ""))
 
     selected_2d_particles = str(class2d["selected_particles"])
-    rejected_2d_particles = str(class2d["selected_particles"])
+    rejected_2d_particles = str(class2d["rejected_particles"])
     total_classified = (selected_2d_particles + rejected_2d_particles)
 
     class2d_summary_html = (

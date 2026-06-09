@@ -35,13 +35,15 @@ Recommended dependencies:
 """
 
 import os
+import re
 import sys
 import argparse
 import numpy as np
 
+from pathlib import Path
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas as rl_canvas
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 _IMPORT_ERRORS = []
 
@@ -73,7 +75,7 @@ try:
     from cryosparc_live_report.images import (
         make_classavg_montages,
         make_micrograph_panel,
-        load_particle_multi_stack_montage,
+        load_particle_multi_stack_montage_matplotlib,
         load_font,
     )
 except Exception as e:
@@ -90,10 +92,17 @@ try:
         draw_single_image_page,
         draw_five_plot_page,
         draw_panel_pages,
+        draw_refinement_summary_page,
     )
 except Exception as e:
     _IMPORT_ERRORS.append(f"cryosparc_live_report.pdf import failed: {e}")
 
+try:
+    from cryosparc_live_report.refinement_pngs import (
+        generate_report_pngs,
+    )
+except Exception as e:
+    generate_report_pngs = None
 
 def print_preflight_errors_and_exit():
     if not _IMPORT_ERRORS:
@@ -117,8 +126,44 @@ def choose_evenly_spaced(items, n):
     idxs = np.linspace(0, len(items) - 1, n)
     return [items[int(round(i))] for i in idxs]
 
+def make_placeholder_pil(text, size=(1200, 500)):
+    img = Image.new("RGB", size, "white")
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, size[0] - 1, size[1] - 1], outline=(180, 180, 180), width=2)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    d.multiline_text((20, 20), text, fill=(90, 90, 90), font=font, spacing=6)
+    return img
 
-def build_report(project_dir: str, session_name: str = "S1") -> int:
+def load_refinement_panel_map(outdir: Path, iteration: int):
+    file_map = {
+        "surface_views": outdir / f"surface_views_iter{iteration:03d}.png",
+        "real_space_slices": outdir / f"real_space_slices_iter{iteration:03d}.png",
+        "per_particle_scale": outdir / f"per_particle_scale_iter{iteration:03d}.png",
+        "fsc": outdir / f"fsc_iter{iteration:03d}.png",
+        "guinier": outdir / f"guinier_iter{iteration:03d}.png",
+        "mask_slices": outdir / f"mask_slices_iter{iteration:03d}.png",
+        "viewing_direction": outdir / f"viewing_direction_distribution_iter{iteration:03d}.png",
+        "posterior_precision": outdir / f"posterior_precision_directional_distribution_iter{iteration:03d}.png",
+        "protein_view_lookup": outdir / f"protein_view_lookup_iter{iteration:03d}.png",
+    }
+
+    panel_map = {}
+    for key, path in file_map.items():
+        if path.is_file():
+            try:
+                with Image.open(path) as im:
+                    panel_map[key] = im.convert("RGB")
+            except Exception as e:
+                panel_map[key] = make_placeholder_pil(f"{key}\nFailed to load:\n{path.name}\n{e}")
+        else:
+            panel_map[key] = None
+
+    return panel_map
+
+def build_report(project_dir: str, session_name: str = "S1", refine_job_uid: str = None) -> int:
     print_preflight_errors_and_exit()
 
     project_dir = os.path.abspath(project_dir)
@@ -350,17 +395,13 @@ def build_report(project_dir: str, session_name: str = "S1") -> int:
                 for e in chosen_exps
             ]
 
-            montage = load_particle_multi_stack_montage(
+            montage = load_particle_multi_stack_montage_matplotlib(
                 stack_paths=stack_paths,
                 row_labels=row_labels,
                 per_stack=6,
                 max_stacks=6,
-                tile_size=96,
-                lowpass_A=25.0,
-                target_display_angpix=3.0,
-                soft_sigma=5.0,
-                output_lo=50,
-                output_hi=180,
+                tile_inches=1.8,
+                autoscale="imshow",
                 invert=False,
             )
 
@@ -384,6 +425,44 @@ def build_report(project_dir: str, session_name: str = "S1") -> int:
 
     sections = build_summary_sections(project, ws, parsed, class_job_uid)
     rows = flatten_summary_sections(sections)
+
+    refinement_panel_map = None
+    refinement_iteration = None
+
+    workspace_refine_job_uid = str(ws.get("phase2_refine_job") or "").strip() or None
+    if not refine_job_uid:
+        refine_job_uid = workspace_refine_job_uid
+
+    if refine_job_uid:
+        refine_job_dir = Path(project_dir) / refine_job_uid
+
+        if not refine_job_dir.is_dir():
+            print(f"Warning: refinement job directory not found: {refine_job_dir}")
+
+        elif generate_report_pngs is None:
+            print("Warning: refinement section skipped because generate_report_pngs is None.")
+
+        else:
+            try:
+                refine_outdir = refine_job_dir / "report_pngs"
+
+                refinement_iteration, _ = generate_report_pngs(
+                    job_folder=refine_job_dir,
+                    outdir=refine_outdir,
+                    pixel_size_override=None,
+                    cmap="viridis",
+                    threshold_value=None,
+                    slice_vmax=None,
+                )
+
+                refinement_panel_map = load_refinement_panel_map(refine_outdir, refinement_iteration)
+
+            except Exception as e:
+                print(f"Warning: failed to generate refinement PNGs for {refine_job_uid}: {e}")
+                import traceback
+                traceback.print_exc()
+    else:
+        print("No refine_job_uid found; refinement section will be skipped.")
 
     project_folder = os.path.basename(project_dir.rstrip(os.sep))
     pdf_name = f"Live_Imaging_Summary_{project_folder}_{session_name}.pdf"
@@ -421,8 +500,7 @@ def build_report(project_dir: str, session_name: str = "S1") -> int:
 
         if particle_panels:
             particle_note = (
-                "Particles are lowpass filtered (25 Å), smoothed, and contrast-modulated "
-                "for ease of viewing; color is inverted (lighter particles on darker background)"
+                "Particles are Butterworth filtered (25 Å) for ease of viewing; color is inverted (lighter particles on darker background)"
             )
             page_num = draw_panel_pages(
                 c,
@@ -430,6 +508,7 @@ def build_report(project_dir: str, session_name: str = "S1") -> int:
                 width,
                 height,
                 margin,
+             
                 "Example Extracted Particles",
                 particle_panels,
                 note=particle_note,
@@ -449,6 +528,24 @@ def build_report(project_dir: str, session_name: str = "S1") -> int:
                 )
             page_num = draw_single_image_page(c, page_num, width, height, margin, heading, classavg_img, note=class_note)
 
+        if refinement_panel_map:
+            print("refinement!")
+            refine_note = f"Refinement summary for job {refine_job_uid}"
+            if refinement_iteration is not None:
+                refine_note += f", iteration {refinement_iteration:03d}"
+            refine_note += "."
+
+            page_num = draw_refinement_summary_page(
+                c,
+                page_num,
+                width,
+                height,
+                margin,
+                f"Refinement Summary ({refine_job_uid})",
+                refinement_panel_map,
+                note=refine_note,
+            )
+
         c.save()
         
     except Exception as e:
@@ -458,12 +555,15 @@ def build_report(project_dir: str, session_name: str = "S1") -> int:
     print(f"Wrote: {pdf_name}")
     if classavg_mrc:
         print(f"Class-average job: {class_job_uid}")
+    if refinement_panel_map:
+        print(f"Refinement job: {refine_job_uid}")
     return 0
 
 def main():
     parser = argparse.ArgumentParser(description="Generate a CryoSPARC Live session PDF report.")
     parser.add_argument("project_dir", help="Path to CryoSPARC project directory")
     parser.add_argument("--session", default="S1", help="Session dir/uid (default: S1)")
+    parser.add_argument("--refine-job", default=None, help="Refinement job uid (default: auto-detected from session)")
     args = parser.parse_args()
 
     rc = build_report(
