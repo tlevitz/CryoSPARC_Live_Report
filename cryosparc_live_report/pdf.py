@@ -91,6 +91,137 @@ def draw_missing_panel(c, x_left, y_top, box_w, box_h, label="Not available"):
     c.setFillColor(colors.black)
 
 
+REFINE_PANEL_TITLES = {
+    "surface_views": "Surface Views",
+    "real_space_slices": "Real Space Slices",
+    "per_particle_scale": "Per-Particle Scale",
+    "fsc": "FSC",
+    "guinier": "Guinier Plot",
+    "mask_slices": "Mask Slices",
+    "viewing_direction": "Viewing Directions",
+    "posterior_precision": "Posterior Precision",
+    "protein_view_lookup": "Protein View Lookup",
+}
+
+
+
+
+def _panel_title_for_key(key: str) -> str:
+    return REFINE_PANEL_TITLES.get(key, key.replace("_", " ").title())
+
+def draw_titled_panel_in_box(
+    c,
+    title,
+    pil_img,
+    x_left,
+    y_top,
+    box_w,
+    box_h,
+    title_fontsize=8,
+    min_title_band_h=18.0,
+    title_gap=3.0,
+    frame_pad=3.0,
+    draw_separator=True,
+):
+    """
+    Draw a single framed panel where the title lives inside the top of the box
+    and the image is centered in the remaining area.
+
+
+    This preserves uniform final title size because the title is still rendered
+    at PDF time, after the panel size is known.
+    """
+    # Outer frame around the entire panel, including title band
+    draw_frame_box(c, x_left, y_top, box_w, box_h)
+
+
+    inner_pad = frame_pad
+
+
+    # Wrap title to panel width
+    text_w = max(box_w - 2 * inner_pad - 2, 10)
+    lines = simpleSplit(title, RL_FONT_FAMILY_BOLD, title_fontsize, text_w)
+
+
+    # Keep title compact
+    if len(lines) > 2:
+        lines = lines[:2]
+        if len(lines[1]) > 3:
+            lines[1] = lines[1][:-3] + "..."
+
+
+    line_h = title_fontsize + 2
+    title_band_h = max(min_title_band_h, len(lines) * line_h + 6)
+
+
+    # Draw title centered inside top band
+    c.setFont(RL_FONT_FAMILY_BOLD, title_fontsize)
+    text_y = y_top - title_fontsize - 2
+    for line in lines:
+        c.drawCentredString(x_left + box_w / 2.0, text_y, line)
+        text_y -= line_h
+
+
+    # Optional separator line between title band and image region
+    img_region_top = y_top - title_band_h
+    if draw_separator:
+        c.line(x_left, img_region_top, x_left + box_w, img_region_top)
+
+
+    # Available area for image inside same outer frame
+    avail_w = box_w - 2 * inner_pad
+    avail_h = box_h - title_band_h - title_gap - 2 * inner_pad
+
+
+    if avail_h <= 8 or avail_w <= 8:
+        return box_h
+
+
+    img_x0 = x_left + inner_pad
+    img_y_top = img_region_top - title_gap - inner_pad
+
+
+    if pil_img is None:
+        c.setFont(RL_FONT_FAMILY, 9)
+        c.setFillColor(colors.grey)
+        c.drawCentredString(
+            x_left + box_w / 2.0,
+            img_y_top - avail_h / 2.0,
+            "Not available",
+        )
+        c.setFillColor(colors.black)
+        return box_h
+
+
+    iw, ih = pil_img.size
+    if iw <= 0 or ih <= 0:
+        return box_h
+
+
+    scale = min(avail_w / float(iw), avail_h / float(ih))
+    scale = max(scale, 0.0)
+
+
+    dw = iw * scale
+    dh = ih * scale
+
+
+    x_img = img_x0 + (avail_w - dw) / 2.0
+    y_img = img_y_top - dh - (avail_h - dh) / 2.0
+
+
+    c.drawImage(
+        ImageReader(pil_img),
+        x_img,
+        y_img,
+        width=dw,
+        height=dh,
+        preserveAspectRatio=True,
+        mask="auto",
+    )
+
+
+    return box_h
 
 def add_summary_pages(c, width, height, margin, project_folder_name, sections, page_num_start=1):
     page_num = page_num_start
@@ -256,16 +387,18 @@ def draw_five_plot_page(c, page_num, width, height, margin, heading, plots, note
 
 def draw_panel_pages(c, page_num, width, height, margin, heading, panels, note=None):
     """
-    Draw full-width panels, exactly 4 per page.
+    Draw panels in a 2x2 grid, exactly 4 per page.
     """
     if not panels:
         return page_num
 
     idx = 0
-    cols = 1
-    rows = 4
-    gap_x = 0.0
-    gap_y = 0.12 * inch
+    cols = 2
+    rows = 2
+
+    # Slightly tighter gaps than before
+    gap_x = 0.08 * inch
+    gap_y = 0.10 * inch
 
     while idx < len(panels):
         y = height - margin
@@ -282,7 +415,7 @@ def draw_panel_pages(c, page_num, width, height, margin, heading, panels, note=N
         if idx == 0 and note:
             note_font = "Helvetica-Oblique"
             note_size = 8
-            note_leading = 11
+            note_leading = 10
             note_width = width - 2 * margin
 
             note_lines = simpleSplit(note, note_font, note_size, note_width)
@@ -293,25 +426,135 @@ def draw_panel_pages(c, page_num, width, height, margin, heading, panels, note=N
                 c.drawString(margin, note_y, line)
                 note_y -= note_leading
 
-            y = note_y - 6
+            y = note_y - 4
 
         avail_w = width - 2 * margin
         avail_h = y - margin
 
-        cell_w = avail_w
+        cell_w = (avail_w - (cols - 1) * gap_x) / cols
         cell_h = (avail_h - (rows - 1) * gap_y) / rows
 
         for r in range(rows):
-            if idx >= len(panels):
-                break
-            x = margin
-            y_top = y - r * (cell_h + gap_y)
-            render_framed_pil(c, panels[idx], x, y_top, cell_w, cell_h, frame_pad=3.0)
-            idx += 1
+            for col in range(cols):
+                if idx >= len(panels):
+                    break
+
+                x = margin + col * (cell_w + gap_x)
+                y_top = y - r * (cell_h + gap_y)
+
+                render_framed_pil(
+                    c,
+                    panels[idx],
+                    x,
+                    y_top,
+                    cell_w,
+                    cell_h,
+                    frame_pad=1.5,   # smaller than before so the image gets more room
+                )
+                idx += 1
 
         draw_page_number(c, page_num, width, margin)
         c.showPage()
         page_num += 1
+
+    return page_num
+
+def draw_initial_model_summary_pages(c, page_num, width, height, margin, heading, class_panels, note=None):
+    """
+    Draw one or more pages containing only initial-model surface-view panels.
+
+
+    class_panels:
+        [
+            ("Surface Views - Class 1", PIL.Image),
+            ("Surface Views - Class 2", PIL.Image),
+            ...
+        ]
+
+
+    Layout:
+      - heading + optional note
+      - up to 3 full-width surface-view panels per page
+    """
+    if not class_panels:
+        return page_num
+
+
+    idx = 0
+    panels_per_page = 3
+    row_gap = 0.10 * inch
+
+
+    while idx < len(class_panels):
+        y = height - margin
+        y = draw_heading(
+            c,
+            heading if idx == 0 else f"{heading} (cont.)",
+            margin,
+            y,
+            level="section",
+            page_height=height,
+            margin=margin,
+        )
+
+
+        if idx == 0 and note:
+            note_font = "Helvetica-Oblique"
+            note_size = 8
+            note_leading = 11
+            note_width = width - 2 * margin
+
+
+            note_lines = simpleSplit(note, note_font, note_size, note_width)
+            c.setFont(note_font, note_size)
+
+
+            note_y = y - 2
+            for line in note_lines:
+                c.drawString(margin, note_y, line)
+                note_y -= note_leading
+
+
+            y = note_y - 6
+
+
+        avail_w = width - 2 * margin
+        avail_h = y - margin
+
+
+        n_this_page = min(panels_per_page, len(class_panels) - idx)
+        inner_h = avail_h - (n_this_page - 1) * row_gap
+        box_h = inner_h / float(n_this_page)
+
+
+        y_top = y
+        for _ in range(n_this_page):
+            label, img = class_panels[idx]
+
+
+            draw_titled_panel_in_box(
+                c,
+                label,
+                img,
+                margin,
+                y_top,
+                avail_w,
+                box_h,
+                title_fontsize=9,
+                min_title_band_h=0.22 * inch,
+                title_gap=4.0,
+                frame_pad=3.0,
+            )
+
+
+            y_top -= box_h + row_gap
+            idx += 1
+
+
+        draw_page_number(c, page_num, width, margin)
+        c.showPage()
+        page_num += 1
+
 
     return page_num
 
@@ -326,67 +569,90 @@ def draw_refinement_summary_page(c, page_num, width, height, margin, heading, pa
     y = height - margin
     y = draw_heading(c, heading, margin, y, level="section", page_height=height, margin=margin)
 
+
     if note:
         note_font = "Helvetica-Oblique"
         note_size = 8
         note_leading = 11
         note_width = width - 2 * margin
 
+
         note_lines = simpleSplit(note, note_font, note_size, note_width)
         c.setFont(note_font, note_size)
+
 
         note_y = y - 2
         for line in note_lines:
             c.drawString(margin, note_y, line)
             note_y -= note_leading
 
+
         y = note_y - 6
+
 
     avail_w = width - 2 * margin
     avail_h = y - margin
 
+
     row_gap = 0.10 * inch
     col_gap = 0.10 * inch
 
-    # Fractions of the usable page height after subtracting row gaps
+
     inner_h = avail_h - 3 * row_gap
     row_fracs = [0.36, 0.20, 0.22, 0.22]
     row_heights = [f * inner_h for f in row_fracs]
 
-    def draw_panel(key, x, y_top, w, h):
-        img = panel_map.get(key)
-        if img is None:
-            draw_missing_panel(c, x, y_top, w, h, label=key.replace("_", " "))
-        else:
-            render_framed_pil_in_box(c, img, x, y_top, w, h, frame_pad=3.0)
 
-    # Row 1
+    def draw_panel(key, x, y_top, w, h):
+        entry = panel_map.get(key)
+
+
+        if isinstance(entry, dict):
+            img = entry.get("image")
+            title = entry.get("title") or _panel_title_for_key(key)
+        else:
+            img = entry
+            title = _panel_title_for_key(key)
+
+
+        draw_titled_panel_in_box(
+            c,
+            title,
+            img,
+            x,
+            y_top,
+            w,
+            h,
+            title_fontsize=9,
+            min_title_band_h=0.24 * inch,
+            title_gap=3.0,
+            frame_pad=3.0,
+        )
+
+
     y_top = y
     draw_panel("surface_views", margin, y_top, avail_w, row_heights[0])
 
-    # Row 2
+
     y_top -= row_heights[0] + row_gap
     cell_w2 = (avail_w - col_gap) / 2.0
     draw_panel("real_space_slices", margin, y_top, cell_w2, row_heights[1])
     draw_panel("per_particle_scale", margin + cell_w2 + col_gap, y_top, cell_w2, row_heights[1])
 
-    # Row 3
+
     y_top -= row_heights[1] + row_gap
     cell_w3 = (avail_w - 2 * col_gap) / 3.0
     draw_panel("fsc", margin, y_top, cell_w3, row_heights[2])
     draw_panel("guinier", margin + cell_w3 + col_gap, y_top, cell_w3, row_heights[2])
     draw_panel("mask_slices", margin + 2 * (cell_w3 + col_gap), y_top, cell_w3, row_heights[2])
 
-    # Row 4
+
     y_top -= row_heights[2] + row_gap
     draw_panel("viewing_direction", margin, y_top, cell_w3, row_heights[3])
     draw_panel("posterior_precision", margin + cell_w3 + col_gap, y_top, cell_w3, row_heights[3])
     draw_panel("protein_view_lookup", margin + 2 * (cell_w3 + col_gap), y_top, cell_w3, row_heights[3])
 
+
     draw_page_number(c, page_num, width, margin)
     c.showPage()
     return page_num + 1
-
-
-
-

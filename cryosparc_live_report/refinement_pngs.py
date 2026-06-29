@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib import transforms
+from matplotlib.collections import PolyCollection
 
 from scipy.ndimage import gaussian_filter, gaussian_filter1d
 from scipy.spatial.transform import Rotation
@@ -24,6 +25,16 @@ try:
 except Exception:
     HAVE_SKIMAGE = False
 
+try:
+    from cryosparc_live_report.textstyle import build_refinement_text_settings
+except Exception:
+    print("no textstyle subscript")
+
+REFINE_TEXT = build_refinement_text_settings()
+
+def set_refinement_text_theme(text_theme=None, overrides=None):
+    global REFINE_TEXT
+    REFINE_TEXT = build_refinement_text_settings(text_theme, overrides=overrides)
 
 # ============================================================
 # file helpers
@@ -45,6 +56,28 @@ def find_latest_iteration(folder: Path) -> int:
 def get_iteration_file(folder: Path, iteration: int, suffix: str):
     matches = sorted(folder.glob(f"*_{iteration:03d}_{suffix}"))
     return matches[0] if matches else None
+
+def find_initial_model_class_maps(folder: Path):
+    """
+    Find ab-initio / initial-model class maps named like:
+        JX_class_00_final_volume.mrc
+        JX_class_01_final_volume.mrc
+        ...
+    Returns:
+        [(class_idx_int, Path), ...] sorted by class index
+    """
+    pattern = re.compile(r"^.+_class_(\d{2})_final_volume\.mrc$")
+    class_maps = []
+
+
+    for f in folder.iterdir():
+        if f.is_file():
+            m = pattern.match(f.name)
+            if m:
+                class_maps.append((int(m.group(1)), f))
+
+
+    return sorted(class_maps, key=lambda x: x[0])
 
 
 def load_mrc(path: Path):
@@ -130,13 +163,19 @@ def symmetric_limits(arr, percentile=99.5):
     return -a, a
 
 
-def choose_threshold(vol, user_threshold=None):
+def choose_threshold(vol, mode, user_threshold=None):
     if user_threshold is not None:
         return float(user_threshold)
-    pos = vol[vol > 0]
-    if pos.size == 0:
-        return float(np.percentile(vol, 95))
-    return float(np.percentile(pos, 97))
+
+    min_val = np.min(vol)
+    max_val = np.max(vol)
+
+    if mode == "initial":
+        return float(min_val + (max_val - min_val) / 4)
+    elif mode == "refine":
+        return float((min_val + max_val) / 2)
+    else:
+        raise ValueError("mode must be 'initial' or 'refine'")
 
 
 def tick_positions(n, n_ticks=6):
@@ -146,6 +185,23 @@ def tick_positions(n, n_ticks=6):
     vals = np.unique(np.round(vals).astype(int))
     return vals.tolist()
 
+def is_nyquist_resolution(res_A, voxel_size_A, atol_A=0.05, rtol=0.01):
+    """
+    Return True if the reported resolution is effectively at Nyquist
+    (2 * voxel_size), allowing for small rounding differences.
+    """
+    try:
+        res_A = float(res_A)
+        voxel_size_A = float(voxel_size_A)
+    except Exception:
+        return False
+
+    if not np.isfinite(res_A) or not np.isfinite(voxel_size_A) or voxel_size_A <= 0:
+        return False
+
+    nyquist_A = 2.0 * voxel_size_A
+    tol = max(float(atol_A), float(rtol) * nyquist_A)
+    return abs(res_A - nyquist_A) <= tol
 
 def _bin_centers(lo, hi, n):
     step = (hi - lo) / float(n)
@@ -230,12 +286,13 @@ def pi_tick_info():
     return xticks, xlabels, yticks, ylabels
 
 
-def add_panel_labels(fig, axes, labels, dy=0.01, fontsize=11):
+def add_panel_labels(fig, axes, labels, dy=0.01, fontsize=None):
+    if fontsize is None:
+        fontsize = REFINE_TEXT["panel_label"]
     for ax, lab in zip(axes, labels):
         bb = ax.get_position()
         xc = 0.5 * (bb.x0 + bb.x1)
         fig.text(xc, bb.y1 + dy, lab, ha="center", va="bottom", fontsize=fontsize)
-
 
 # ============================================================
 # slice extraction
@@ -245,21 +302,65 @@ def add_panel_labels(fig, axes, labels, dy=0.01, fontsize=11):
 def get_slices_yz_xz_xy(vol):
     zc, yc, xc = [s // 2 for s in vol.shape]
 
-    yz = np.flipud(vol[:, :, xc].T)   # (y, z)
-    xz = np.flipud(vol[:, yc, :])     # (z, x)
-    xy = np.flipud(vol[zc, :, :])     # (y, x)
+    # vol is indexed as vol[z, y, x]
+    # Desired displayed orientations (described using a top-left image origin):
+    #   YZ: y increases left->right, z increases top->bottom
+    #   XZ: x increases left->right, z increases top->bottom
+    #   XY: x increases left->right, y increases top->bottom
+    #
+    # Since these are shown with origin="lower", the vertical axis must be
+    # reversed in the array so the second coordinate increases top->bottom.
+
+    yz = vol[::-1, :, xc]      # rows=z reversed, cols=y
+    xz = vol[::-1, yc, :]      # rows=z reversed, cols=x
+    xy = vol[zc, ::-1, :]      # rows=y reversed, cols=x
 
     return [yz, xz, xy]
 
+def format_slice_axes(ax, img, top_left_origin=True, put_x_ticks_on_top=True):
+    h, w = img.shape[:2]
 
-def format_slice_axes(ax, img):
-    xt = tick_positions(img.shape[1])
-    yt = tick_positions(img.shape[0])
+    xt = tick_positions(w)
+    yt = tick_positions(h)
+
     ax.set_xticks(xt)
     ax.set_yticks(yt)
-    ax.set_xticklabels([str(t) for t in xt], fontsize=8)
-    ax.set_yticklabels([str(t) for t in yt], fontsize=8)
 
+    if top_left_origin:
+        # x increases left -> right
+        xlabels = [str(t) for t in xt]
+
+        # because imshow(..., origin="lower"), displayed y runs bottom -> top
+        # so reverse the labels to make the displayed top be 0
+        ylabels = [str(h - 1 - t) for t in yt]
+    else:
+        xlabels = [str(t) for t in xt]
+        ylabels = [str(t) for t in yt]
+
+    ax.set_xticklabels(xlabels, fontsize=REFINE_TEXT["tick"])
+    ax.set_yticklabels(ylabels, fontsize=REFINE_TEXT["tick"])
+
+    if put_x_ticks_on_top:
+        ax.xaxis.tick_top()
+        ax.tick_params(
+            axis="x",
+            labeltop=True,
+            labelbottom=False,
+            top=True,
+            bottom=False,
+            pad=2,
+        )
+    else:
+        ax.tick_params(
+            axis="x",
+            labeltop=False,
+            labelbottom=True,
+            top=False,
+            bottom=True,
+            pad=2,
+        )
+
+    ax.tick_params(axis="y", pad=2)
 
 # ============================================================
 # real-space slices
@@ -272,6 +373,7 @@ def save_slice_panel(
     cmap="viridis",
     symmetric=True,
     manual_vmax=None,
+    embed_title=True,
 ):
     slices = get_slices_yz_xz_xy(vol)
 
@@ -299,14 +401,20 @@ def save_slice_panel(
         axes.append(ax)
         last_im = im
 
-    fig.suptitle(title, fontsize=13, y=0.96)
-    add_panel_labels(fig, axes, ["YZ", "XZ", "XY"], dy=0.012, fontsize=11)
+    if embed_title:
+        if gsfsc_value is not None and np.isfinite(gsfsc_value):
+            ax.set_title(
+                f"FSC (0.143 = {gsfsc_value:.2f} Å)",
+                fontsize=REFINE_TEXT["title"]
+            )
+        else:
+            ax.set_title("FSC", fontsize=REFINE_TEXT["title"])
 
     # single-row-height colorbar
     bb = axes[-1].get_position()
     cax = fig.add_axes([0.90, bb.y0, 0.018, bb.height])
     cb = fig.colorbar(last_im, cax=cax)
-    cb.ax.tick_params(labelsize=8)
+    cb.ax.tick_params(labelsize=REFINE_TEXT["colorbar"])
 
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -316,7 +424,7 @@ def save_slice_panel(
 # stacked mask slices
 # ============================================================
 
-def save_stacked_mask_panel(mask_items, out_path: Path, title: str, cmap="viridis"):
+def save_stacked_mask_panel(mask_items, out_path: Path, title: str, cmap="viridis", embed_title=True):
     """
     mask_items: list of (row_label, volume)
     """
@@ -331,15 +439,19 @@ def save_stacked_mask_panel(mask_items, out_path: Path, title: str, cmap="viridi
     gs = fig.add_gridspec(
         nrows, 3,
         left=0.08, right=0.87, bottom=0.06, top=0.88,
-        hspace=0.36, wspace=0.24
+        hspace=0.9, wspace=0.24
     )
 
-    first_row_axes = None
+    all_row_axes = []
     last_im = None
+
+    row_label_fs = REFINE_TEXT.get("mask_row_label", REFINE_TEXT["axis"] + 10)
+    plane_label_fs = REFINE_TEXT.get("mask_plane_label", REFINE_TEXT["axis"] + 2)
 
     for r, (row_label, vol) in enumerate(mask_items):
         slices = get_slices_yz_xz_xy(vol)
         row_axes = []
+
         for c, img in enumerate(slices):
             ax = fig.add_subplot(gs[r, c])
             im = ax.imshow(img, cmap=cmap, origin="lower", vmin=vmin, vmax=vmax, aspect="equal")
@@ -347,18 +459,35 @@ def save_stacked_mask_panel(mask_items, out_path: Path, title: str, cmap="viridi
             row_axes.append(ax)
             last_im = im
 
-        row_axes[0].set_ylabel(row_label, fontsize=11)
-        if r == 0:
-            first_row_axes = row_axes
+        # Center row label above this row
+        row_bb_left = row_axes[0].get_position()
+        row_bb_right = row_axes[-1].get_position()
+        x_center = 0.5 * (row_bb_left.x0 + row_bb_right.x1)
+        y_top = row_bb_left.y1
 
-    fig.suptitle(title, fontsize=13, y=0.965)
+        fig.text(
+            x_center,
+            y_top + 0.020,
+            row_label,
+            ha="center",
+            va="bottom",
+            fontsize=row_label_fs,
+        )
 
-    if first_row_axes is not None:
-        add_panel_labels(fig, first_row_axes, ["YZ", "XZ", "XY"], dy=0.010, fontsize=11)
+        all_row_axes.append(row_axes)
+
+    if embed_title:
+        fig.suptitle(title, fontsize=REFINE_TEXT["title"], y=0.965)
+
+    # Colorbar
+    if all_row_axes:
+        first_row_axes = all_row_axes[0]
+
+        # Colorbar aligned to first row height
         bb = first_row_axes[-1].get_position()
         cax = fig.add_axes([0.90, bb.y0, 0.018, bb.height])
         cb = fig.colorbar(last_im, cax=cax)
-        cb.ax.tick_params(labelsize=8)
+        cb.ax.tick_params(labelsize=REFINE_TEXT["colorbar"])
 
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -375,9 +504,9 @@ def save_threshold_outputs(vol, out_png: Path, out_txt: Path, threshold_value):
     fig = plt.figure(figsize=(4.2, 2.4), dpi=200)
     ax = fig.add_subplot(111)
     ax.axis("off")
-    ax.text(0.05, 0.78, "Threshold", fontsize=13, weight="bold")
-    ax.text(0.05, 0.43, f"{threshold_value:.3f}", fontsize=22)
-    ax.text(0.05, 0.14, f"Min: {vmin:.3f}  Max: {vmax:.3f}", fontsize=10)
+    ax.text(0.05, 0.78, "Threshold", fontsize=REFINE_TEXT["title"], weight="bold")
+    ax.text(0.05, 0.43, f"{threshold_value:.3f}", fontsize=REFINE_TEXT["big_number"])
+    ax.text(0.05, 0.14, f"Min: {vmin:.3f}  Max: {vmax:.3f}", fontsize=REFINE_TEXT["annotation"])
     fig.tight_layout()
     fig.savefig(out_png, bbox_inches="tight")
     plt.close(fig)
@@ -393,24 +522,63 @@ def save_threshold_outputs(vol, out_png: Path, out_txt: Path, threshold_value):
 # surface views
 # ============================================================
 
-def choose_display_map_path(map_path: Path, gsfsc_value):
+def choose_display_map_path(map_path: Path, gsfsc_value, voxel_size_A=None):
     """
-    Use the sharpened map only when GSFSC < 3.5 Å.
-    For GSFSC >= 3.5 Å (including exactly 3.5), use the unsharpened map.
+    Choose which map to use for display products (surface views / slices / lookup).
+
+    Rules:
+      - If GSFSC is unavailable: use unsharpened map
+      - If GSFSC is at Nyquist: use unsharpened map
+      - Else if GSFSC >= 3.5 Å: use unsharpened map
+      - Else if GSFSC < 3.5 Å and sharpened map exists: use sharpened map
+      - Else: fall back to unsharpened map
+
+    Returns
+    -------
+    display_map_path : Path
+    display_mode : str
+        "sharpened" or "unsharpened"
+    display_reason : str
+        Human-readable reason for note text / logging
     """
-    if gsfsc_value is None or gsfsc_value >= 3.5:
-        return map_path
+    if gsfsc_value is None or not np.isfinite(gsfsc_value):
+        return map_path, "unsharpened", "GSFSC unavailable"
+
+    gsfsc_value = float(gsfsc_value)
+
+    if voxel_size_A is not None and is_nyquist_resolution(gsfsc_value, voxel_size_A):
+        nyquist_A = 2.0 * float(voxel_size_A)
+        return (
+            map_path,
+            "unsharpened",
+            f"GSFSC {gsfsc_value:.2f} Å is at Nyquist ({nyquist_A:.2f} Å)"
+        )
+
+    if gsfsc_value >= 3.5:
+        return (
+            map_path,
+            "unsharpened",
+            f"GSFSC {gsfsc_value:.2f} Å is >= 3.5 Å"
+        )
 
     sharp_path = map_path.with_name(f"{map_path.stem}_sharp{map_path.suffix}")
     if sharp_path.exists():
-        return sharp_path
+        return (
+            sharp_path,
+            "sharpened",
+            f"GSFSC {gsfsc_value:.2f} Å is < 3.5 Å"
+        )
 
     print(
         f"[warn] GSFSC resolution {gsfsc_value:.2f} Å < 3.5 Å, "
         f"but sharpened map not found: {sharp_path.name}. "
         f"Using unsharpened map instead."
     )
-    return map_path
+    return (
+        map_path,
+        "unsharpened",
+        f"GSFSC {gsfsc_value:.2f} Å is < 3.5 Å but sharpened map was not found"
+    )
 
 def _camera_direction(azim_deg, elev_deg):
     """
@@ -465,6 +633,51 @@ def _make_facecolors(normals, azim, elev):
     facecolors[:, 3] = 1.0
     return facecolors
 
+def _make_facecolors_from_viewdir(normals, view_dir):
+    """
+    Brighter grayscale shading with softer shadows, using an explicit
+    object-to-camera view direction.
+    """
+    normals = np.asarray(normals, dtype=np.float32)
+    if normals.ndim != 2 or normals.shape[1] != 3:
+        raise ValueError(
+            f"_make_facecolors_from_viewdir expected normals with shape (N, 3), got {normals.shape}"
+        )
+
+    normals = _normalize_vectors(normals).astype(np.float32)
+    view_dir = _normalize_vectors(view_dir).astype(np.float32)
+
+    key_light = np.array([0.30, 0.35, 0.88], dtype=np.float32)
+    key_light /= np.linalg.norm(key_light)
+
+    fill_light = np.array([-0.55, -0.15, 0.82], dtype=np.float32)
+    fill_light /= np.linalg.norm(fill_light)
+
+    diffuse_key = np.abs(np.einsum("ij,j->i", normals, key_light))
+    diffuse_fill = np.abs(np.einsum("ij,j->i", normals, fill_light))
+
+    half_vec = key_light + view_dir
+    hn = float(np.linalg.norm(half_vec))
+    if hn > 0:
+        half_vec = half_vec / hn
+    else:
+        half_vec = key_light
+
+    spec = np.clip(np.einsum("ij,j->i", normals, half_vec), 0.0, 1.0) ** 16
+
+    shade = (
+        0.24
+        + 0.62 * diffuse_key
+        + 0.18 * diffuse_fill
+        + 0.10 * spec
+    )
+
+    gray = np.clip(0.25 + 0.45 * shade, 0.0, 1.0).astype(np.float32)
+
+    facecolors = np.empty((normals.shape[0], 4), dtype=np.float32)
+    facecolors[:, :3] = gray[:, None]
+    facecolors[:, 3] = 1.0
+    return facecolors
 
 def _render_surface_panel_image(tri_verts, normals, azim, elev, lim, panel_px, dpi, roll=0):
     """
@@ -502,6 +715,68 @@ def _render_surface_panel_image(tri_verts, normals, azim, elev, lim, panel_px, d
     plt.close(fig)
     return img
 
+def _render_surface_panel_projection_image(
+    tri_verts,
+    normals,
+    horizontal_axis,
+    vertical_axis,
+    depth_axis,
+    view_dir,
+    lim,
+    panel_px,
+    dpi,
+):
+    """
+    Render a principal orthographic projection of the surface mesh into an RGBA image.
+
+    horizontal_axis, vertical_axis, depth_axis are indices into x/y/z = 0/1/2.
+
+    The displayed convention is:
+      - horizontal axis increases left -> right
+      - vertical axis increases top -> bottom
+
+    Since matplotlib 2D axes increase upward, we negate the vertical coordinate
+    so that the requested axis increases downward in the final image.
+    """
+    facecolors = _make_facecolors_from_viewdir(normals, view_dir)
+
+    # Project triangles into 2D:
+    #   u = chosen horizontal axis
+    #   v = - chosen vertical axis   (so displayed top->bottom is increasing)
+    u = tri_verts[:, :, horizontal_axis]
+    v = -tri_verts[:, :, vertical_axis]
+    polys_2d = np.stack([u, v], axis=2)
+
+    # Painter's algorithm: draw far faces first, near faces last
+    depth = tri_verts.mean(axis=1)[:, depth_axis]
+    order = np.argsort(depth)
+
+    fig = plt.figure(
+        figsize=(panel_px / dpi, panel_px / dpi),
+        dpi=dpi,
+        facecolor="white",
+    )
+
+    ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], facecolor="white")
+
+    coll = PolyCollection(
+        polys_2d[order],
+        facecolors=facecolors[order],
+        edgecolors="none",
+        linewidths=0.0,
+        antialiaseds=False,
+    )
+    ax.add_collection(coll)
+
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+
+    fig.canvas.draw()
+    img = np.asarray(fig.canvas.buffer_rgba()).copy()
+    plt.close(fig)
+    return img
 
 def _crop_white_border(img, white_threshold=250, pad=8):
     """
@@ -549,14 +824,19 @@ def save_surface_views(
     spacing=(1.0, 1.0, 1.0),
     panel_px=900,
     dpi=200,
+    embed_header=True,
+    embed_plane_labels=True,
 ):
-
-    fig_w_px = 3 * panel_px + 2 * 36 + 36 + 36
-    fig_h_px = panel_px + 70 + 110
-
+    fig_header_px = 110 if embed_header else 16
+    fig_footer_px = 16
     left_px = 36
+    right_px = 36
     gap_px = 36
-    bottom_px = 70
+
+
+    fig_w_px = left_px + 3 * panel_px + 2 * gap_px + right_px
+    fig_h_px = fig_header_px + panel_px + fig_footer_px
+
 
     fig = plt.figure(
         figsize=(fig_w_px / dpi, fig_h_px / dpi),
@@ -564,9 +844,11 @@ def save_surface_views(
         facecolor="white"
     )
 
+
     vmin = float(np.min(vol))
     vmax = float(np.max(vol))
     level = float(threshold_value)
+
 
     if not HAVE_SKIMAGE:
         ax = fig.add_axes([0, 0, 1, 1])
@@ -574,17 +856,20 @@ def save_surface_views(
         ax.text(
             0.5, 0.5,
             "Surface render skipped:\nscikit-image not available",
-            ha="center", va="center", fontsize=14
+            ha="center", va="center", fontsize=REFINE_TEXT["title"]
         )
         fig.savefig(out_path, facecolor="white", dpi=dpi)
         plt.close(fig)
         return
 
+
     ds = np.asarray(vol[::step, ::step, ::step], dtype=np.float32)
+
 
     smooth_sigma = 0.5
     if smooth_sigma > 0:
         ds = gaussian_filter(ds, sigma=smooth_sigma)
+
 
     ds_min = float(ds.min())
     ds_max = float(ds.max())
@@ -594,7 +879,7 @@ def save_surface_views(
         ax.text(
             0.5, 0.5,
             f"Threshold {level:.3f} outside\nvolume range [{ds_min:.3f}, {ds_max:.3f}]",
-            ha="center", va="center", fontsize=14
+            ha="center", va="center", fontsize=REFINE_TEXT["title"]
         )
         fig.savefig(out_path, facecolor="white", dpi=dpi)
         plt.close(fig)
@@ -615,7 +900,7 @@ def save_surface_views(
         ax.text(
             0.5, 0.5,
             f"Surface render failed:\n{type(e).__name__}",
-            ha="center", va="center", fontsize=14
+            ha="center", va="center", fontsize=REFINE_TEXT["title"]
         )
         fig.savefig(out_path, facecolor="white", dpi=dpi)
         plt.close(fig)
@@ -627,7 +912,6 @@ def save_surface_views(
         faces = faces[keep]
 
     verts = verts - verts.mean(axis=0)
-
     tri_verts = verts[faces]
 
     fn = np.cross(tri_verts[:, 1] - tri_verts[:, 0], tri_verts[:, 2] - tri_verts[:, 0])
@@ -645,26 +929,30 @@ def save_surface_views(
         max_span = 1.0
     lim = 0.55 * max_span
 
-    # Define the three principal plane views in the canonical world convention:
-    #   +y camera -> XZ plane
-    #   +x camera -> YZ plane
-    #   +z camera -> XY plane
-    views = [
-        ("XZ Plane", np.array([0.0, 1.0, 0.0], dtype=np.float32)),
-        ("YZ Plane", np.array([1.0, 0.0, 0.0], dtype=np.float32)),
-        ("XY Plane", np.array([0.0, 0.0, 1.0], dtype=np.float32)),
+    # Principal projections matched to the slice conventions:
+    #   XY: x increases left->right, y increases top->bottom
+    #   YZ: y increases left->right, z increases top->bottom
+    #   XZ: x increases left->right, z increases top->bottom
+    principal_views = [
+        ("YZ Plane", dict(horizontal_axis=1, vertical_axis=2, depth_axis=0,
+                          view_dir=np.array([1.0, 0.0, 0.0], dtype=np.float32))),
+        ("XZ Plane", dict(horizontal_axis=0, vertical_axis=2, depth_axis=1,
+                          view_dir=np.array([0.0, 1.0, 0.0], dtype=np.float32))),
+        ("XY Plane", dict(horizontal_axis=0, vertical_axis=1, depth_axis=2,
+                          view_dir=np.array([0.0, 0.0, 1.0], dtype=np.float32))),
     ]
 
     crop_pad = max(6, panel_px // 100)
 
     rendered_panels = []
-    for lab, viewdir in views:
-        azim, elev = viewdir_to_mpl_angles(viewdir)
-        img = _render_surface_panel_image(
+    for lab, cfg in principal_views:
+        img = _render_surface_panel_projection_image(
             tri_verts=tri_verts,
             normals=fn,
-            azim=azim,
-            elev=elev,
+            horizontal_axis=cfg["horizontal_axis"],
+            vertical_axis=cfg["vertical_axis"],
+            depth_axis=cfg["depth_axis"],
+            view_dir=cfg["view_dir"],
             lim=lim,
             panel_px=panel_px,
             dpi=dpi,
@@ -674,47 +962,64 @@ def save_surface_views(
         rendered_panels.append((lab, img))
 
     common_side = max(max(img.shape[0], img.shape[1]) for _, img in rendered_panels)
-
-    # Add a little breathing room so the rendered object does not feel too large
-    # inside the panel and does not crowd the title area.
     extra_margin_px = max(24, panel_px // 14)
+
 
     rendered_panels = [
         (lab, _pad_to_square_canvas(img, common_side + 2 * extra_margin_px))
         for lab, img in rendered_panels
     ]
 
-    axes = []
+
+    surface_label_fs = 8
+    surface_header_fs = REFINE_TEXT.get("surface_header", 9)
+
+
     for i, (lab, img) in enumerate(rendered_panels):
         x0_px = left_px + i * (panel_px + gap_px)
 
+
         ax = fig.add_axes([
             x0_px / fig_w_px,
-            bottom_px / fig_h_px,
+            fig_footer_px / fig_h_px,
             panel_px / fig_w_px,
             panel_px / fig_h_px,
         ], facecolor="white")
 
+
         ax.imshow(img)
         ax.set_axis_off()
-        axes.append((lab, x0_px))
+
+
+        if embed_plane_labels:
+            ax.text(
+                0.5, 0.02,
+                lab,
+                transform=ax.transAxes,
+                ha="center", va="bottom",
+                fontsize=surface_label_fs,
+                bbox=dict(
+                    boxstyle="round,pad=0.18",
+                    facecolor="white",
+                    alpha=0.85,
+                    edgecolor="none",
+                ),
+            )
+
 
     vx = spacing[2]
 
-    fig.text(
-        0.5, 0.975,
-        f"{title}\nThreshold: {level:.3f}    Min: {vmin:.3f}    Max: {vmax:.3f}    "
-        f"Voxel size: {vx:.3f} Å/px",
-        ha="center", va="top", fontsize=10
-    )
 
-    for lab, x0_px in axes:
+    if embed_header:
         fig.text(
-            (x0_px + 0.5 * panel_px) / fig_w_px,
-            (bottom_px - 18) / fig_h_px,
-            lab,
-            ha="center", va="top", fontsize=10
+            0.5, 0.985,
+            f"{title}\nThreshold: {level:.3f}    Min: {vmin:.3f}    Max: {vmax:.3f}    "
+            f"Voxel size: {vx:.3f} Å/px",
+            ha="center", va="top",
+            fontsize=surface_header_fs,
+            linespacing=1.15,
         )
+
 
     fig.savefig(out_path, facecolor="white", dpi=dpi)
     plt.close(fig)
@@ -731,7 +1036,7 @@ def pick_existing_field(arr, candidates):
     return None
 
 
-def save_alpha_histogram(particles_cs: Path, rejected_cs: Path, out_path: Path, title: str, cmap="viridis"):
+def save_alpha_histogram(particles_cs: Path, rejected_cs: Path, out_path: Path, title: str, cmap="viridis", embed_title=True):
     arr = load_cs(particles_cs)
     alpha_field = pick_existing_field(arr, ["alignments3D/alpha", "alignments2D/alpha"])
     if alpha_field is None:
@@ -768,10 +1073,16 @@ def save_alpha_histogram(particles_cs: Path, rejected_cs: Path, out_path: Path, 
             )
 
     ax.set_xlim(*display_range)
-    ax.set_title(f"{title}\nPer-particle scale factors (mean: {np.mean(alpha):.3f})")
-    ax.set_xlabel(alpha_field)
-    ax.set_ylabel("# of particles")
-    ax.legend()
+    if embed_title:
+        ax.set_title(
+            f"Mean: {np.mean(alpha):.3f}",
+            fontsize=REFINE_TEXT["title"],
+        )
+    ax.set_xlabel(alpha_field, fontsize=REFINE_TEXT["axis"])
+    ax.set_ylabel("# of particles", fontsize=REFINE_TEXT["axis"])
+    ax.tick_params(axis="both", labelsize=REFINE_TEXT["tick"])
+    ax.legend(fontsize=REFINE_TEXT["legend"], edgecolor="white")
+
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -842,6 +1153,7 @@ def render_directional_plot(
     log_scale: bool = False,
     cmap: str = "viridis",
     cbar_label: str = None,
+    embed_title: bool = True,
 ):
     """
     plot_data must have shape (ny, nx)
@@ -882,20 +1194,22 @@ def render_directional_plot(
 
     xticks, xlabels, yticks, ylabels = pi_tick_info()
     ax.set_xticks(xticks)
-    ax.set_xticklabels(xlabels)
+    ax.set_xticklabels(xlabels, fontsize=REFINE_TEXT["title"])
     ax.set_yticks(yticks)
-    ax.set_yticklabels(ylabels)
+    ax.set_yticklabels(ylabels, fontsize=REFINE_TEXT["title"])
 
     ax.set_xlim(-np.pi, np.pi)
     ax.set_ylim(-np.pi / 2, np.pi / 2)
 
-    ax.set_xlabel("Azimuth")
-    ax.set_ylabel("Elevation")
-    ax.set_title(title)
+    ax.set_xlabel("Azimuth", fontsize=REFINE_TEXT["title"])
+    ax.set_ylabel("Elevation", fontsize=REFINE_TEXT["title"])
+    if embed_title:
+        ax.set_title(title, fontsize=REFINE_TEXT["title"])
 
     cbar = fig.colorbar(im, ax=ax)
+    cbar.ax.tick_params(labelsize=REFINE_TEXT["colorbar"])
     if cbar_label is not None:
-        cbar.set_label(cbar_label)
+        cbar.set_label(cbar_label, fontsize=REFINE_TEXT["title"])
 
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
@@ -912,6 +1226,7 @@ def save_viewing_direction_distribution(
     cmap="viridis",
     cbar_label="# of images",
     use_inverse=True,
+    embed_title=True,
 ):
     arr = load_cs(particles_cs)
 
@@ -949,6 +1264,7 @@ def save_viewing_direction_distribution(
         log_scale=log_scale,
         cmap=cmap,
         cbar_label=cbar_label,
+        embed_title=embed_title,
     )
 
 def electron_wavelength_A(accel_kv):
@@ -1029,6 +1345,7 @@ def save_posterior_precision_directional_distribution_fast(
     freq_samples=24,
     n_circle_samples=None,
     particle_chunk=1024,
+    embed_title=True,
 ):
     """
     Fast approximation of posterior precision directional distribution.
@@ -1200,6 +1517,7 @@ def save_posterior_precision_directional_distribution_fast(
         log_scale=log_scale,
         cmap=cmap,
         cbar_label=cbar_label,
+        embed_title=embed_title,
     )
 
 
@@ -1321,6 +1639,7 @@ def save_fsc_plot(
     gsfsc_value=None,
     cmap="viridis",
     smooth_sigma_bins=1,
+    embed_title=True,
 ):
     half_a, voxel_a = load_mrc(half_a_path)
     half_b, voxel_b = load_mrc(half_b_path)
@@ -1367,17 +1686,19 @@ def save_fsc_plot(
 
     ax.set_xlim(start_res, nyquist_res)
     ax.set_ylim(0.0, 1.02)
-    ax.set_xlabel("Resolution (Å)")
-    ax.set_ylabel("FSC")
+    ax.set_xlabel("Resolution (Å)", fontsize=REFINE_TEXT["axis"])
+    ax.set_ylabel("FSC", fontsize=REFINE_TEXT["axis"])
+    ax.tick_params(axis="both", labelsize=REFINE_TEXT["tick"])
 
     set_fsc_xticks(ax, start_res, nyquist_res, gsfsc_value=gsfsc_value)
 
-    if gsfsc_value is not None:
-        ax.set_title(f"{title}\nGSFSC Resolution: {gsfsc_value:.2f}Å")
-    else:
-        ax.set_title(title)
+    if embed_title:
+        if gsfsc_value is not None:
+            ax.set_title(f"{title}\nGSFSC Resolution: {gsfsc_value:.2f}Å", fontsize=REFINE_TEXT["title"])
+        else:
+            ax.set_title(title, fontsize=REFINE_TEXT["title"])
 
-    ax.legend()
+    ax.legend(fontsize=REFINE_TEXT["legend"], edgecolor="white")
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -1432,7 +1753,7 @@ def radial_amplitude_profile(vol, voxel_size, mask=None, n_bins=160):
 
 
 def save_guinier_plot(map_path: Path, mask_path: Path, out_path: Path, title: str,
-                      pixel_size_override=None, cmap="viridis", gsfsc=None):
+                      pixel_size_override=None, cmap="viridis", gsfsc=None, embed_title=True):
     vol, voxel0 = load_mrc(map_path)
     voxel = pixel_size_override or voxel0 or 1.0
 
@@ -1577,9 +1898,11 @@ def save_guinier_plot(map_path: Path, mask_path: Path, out_path: Path, title: st
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(tick_labels)
 
-    ax.set_xlabel("Resolution (Å)")
-    ax.set_ylabel("log F")
-    ax.set_title(title)
+    ax.set_xlabel("Resolution (Å)", fontsize=REFINE_TEXT["axis"])
+    ax.set_ylabel("log F", fontsize=REFINE_TEXT["axis"])
+    if embed_title:
+        ax.set_title(title, fontsize=REFINE_TEXT["title"])
+    ax.tick_params(axis="both", labelsize=REFINE_TEXT["tick"])
 
     # Replace legend with B-factor text
     if b_factor is not None:
@@ -1588,11 +1911,12 @@ def save_guinier_plot(map_path: Path, mask_path: Path, out_path: Path, title: st
             f"B-factor = {b_factor:.0f} Å²",
             transform=ax.transAxes,
             ha="right", va="top",
+            fontsize=REFINE_TEXT["legend"],
             bbox=dict(
                 boxstyle="round,pad=0.3",
                 facecolor="white",
                 alpha=0.85,
-                edgecolor="0.7"
+                edgecolor="white"
             )
         )
     else:
@@ -1601,11 +1925,12 @@ def save_guinier_plot(map_path: Path, mask_path: Path, out_path: Path, title: st
             "B-factor = n/a",
             transform=ax.transAxes,
             ha="right", va="top",
+            fontsize=REFINE_TEXT["legend"],
             bbox=dict(
                 boxstyle="round,pad=0.3",
                 facecolor="white",
                 alpha=0.85,
-                edgecolor="0.7"
+                edgecolor="white"
             )
         )
 
@@ -1626,6 +1951,7 @@ def save_protein_view_lookup(
     spacing=(1.0, 1.0, 1.0),
     panel_px=240,
     dpi=300,
+    embed_title=True,
 ):
     """
     Render a 4x8 lookup chart of isosurface views corresponding to
@@ -1650,7 +1976,7 @@ def save_protein_view_lookup(
         ax.text(
             0.5, 0.5,
             "Protein view lookup skipped:\nscikit-image not available",
-            ha="center", va="center", fontsize=14
+            ha="center", va="center", fontsize=REFINE_TEXT["title"]
         )
         fig.savefig(out_path, bbox_inches="tight", facecolor="white")
         plt.close(fig)
@@ -1793,25 +2119,29 @@ def save_protein_view_lookup(
         ax.axhline(y, color="0.82", linewidth=0.8, zorder=5)
 
     xticks, xlabels, yticks, ylabels = pi_tick_info()
+    lookup_tick_fs = REFINE_TEXT.get("lookup_tick", REFINE_TEXT["tick"] + 10)
+    lookup_axis_fs = REFINE_TEXT.get("lookup_axis", REFINE_TEXT["axis"] + 10)
+
     ax.set_xticks(xticks)
-    ax.set_xticklabels(xlabels)
+    ax.set_xticklabels(xlabels, fontsize=lookup_tick_fs)
     ax.set_yticks(yticks)
-    ax.set_yticklabels(ylabels)
+    ax.set_yticklabels(ylabels, fontsize=lookup_tick_fs)
 
     ax.set_xlim(-np.pi, np.pi)
     ax.set_ylim(-np.pi / 2, np.pi / 2)
 
-    ax.set_xlabel("Azimuth")
-    ax.set_ylabel("Elevation")
+    ax.set_xlabel("Azimuth", fontsize=lookup_axis_fs)
+    ax.set_ylabel("Elevation", fontsize=lookup_axis_fs)
 
     vx = spacing[2]
-    ax.set_title(
-        f"{title}\n"
-        f"Views rendered at azimuth/elevation bin centers    "
-        f"Threshold: {level:.3f}    Min: {vmin:.3f}    Max: {vmax:.3f}    "
-        f"Voxel size: {vx:.3f} Å/px",
-        fontsize=10
-    )
+    if embed_title:
+        ax.set_title(
+            f"{title}\n"
+            f"Views rendered at azimuth/elevation bin centers    "
+            f"Threshold: {level:.3f}    Min: {vmin:.3f}    Max: {vmax:.3f}    "
+            f"Voxel size: {vx:.3f} Å/px",
+            fontsize=REFINE_TEXT["annotation"]
+        )
 
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight", facecolor="white")
@@ -1822,6 +2152,76 @@ def save_protein_view_lookup(
 # main
 # ============================================================
 
+def generate_initial_model_pngs(
+    job_folder: Path,
+    outdir: Path,
+    cmap="viridis",
+    threshold_value=None,
+    text_theme=None,
+    embed_titles=True,
+):
+    """
+    Generate only surface-view PNGs for ab-initio / initial-model classes.
+
+
+    Returns a list of dicts:
+        [
+            {
+                "class_index": 0,
+                "class_number": 1,
+                "title": "Surface Views - Class 1",
+                "path": Path(...),
+            },
+            ...
+        ]
+    """
+    set_refinement_text_theme(text_theme)
+
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    class_maps = find_initial_model_class_maps(job_folder)
+    if not class_maps:
+        raise FileNotFoundError(
+            f"No initial-model class maps found in {job_folder}. "
+            f"Expected files like '{job_folder.name}_class_00_final_volume.mrc'."
+        )
+
+    outputs = []
+
+    for class_idx, map_path in class_maps:
+        vol, voxel = load_mrc(map_path)
+        spacing = (voxel, voxel, voxel) if voxel is not None else (1.0, 1.0, 1.0)
+
+        surface_threshold = choose_threshold(vol, user_threshold=threshold_value, mode="initial")
+
+        class_number = class_idx
+        title = f"Surface Views - Class {class_number}"
+        out_path = outdir / f"initial_model_surface_views_class{class_number:02d}.png"
+
+        save_surface_views(
+            vol=vol,
+            out_path=out_path,
+            title=title,
+            threshold_value=surface_threshold,
+            step=1,
+            spacing=spacing,
+            panel_px=900,
+            dpi=400,
+            embed_header=embed_titles,
+            embed_plane_labels=True,
+        )
+
+        outputs.append({
+            "class_index": class_idx,
+            "class_number": class_number,
+            "title": title,
+            "path": out_path,
+            "threshold": float(surface_threshold),
+        })
+
+    return outputs
+
+
 def generate_report_pngs(
     job_folder: Path,
     outdir: Path,
@@ -1829,7 +2229,11 @@ def generate_report_pngs(
     cmap="viridis",
     threshold_value=None,
     slice_vmax=None,
+    text_theme=None,
+    embed_titles=True,
 ):
+    set_refinement_text_theme(text_theme)
+
     outdir.mkdir(parents=True, exist_ok=True)
 
     iteration = find_latest_iteration(job_folder)
@@ -1856,9 +2260,13 @@ def generate_report_pngs(
     gsfsc = load_gsfsc_from_job_json(job_folder, iteration)
 
     # For display products:
-    # GSFSC < 3.5 Å -> sharpened map
-    # GSFSC >= 3.5 Å (including exactly 3.5) -> unsharpened map
-    display_map_path = choose_display_map_path(map_path, gsfsc)
+    # - use sharpened only when GSFSC < 3.5 Å
+    # - but if GSFSC is at Nyquist, force unsharpened
+    display_map_path, display_map_mode, display_map_reason = choose_display_map_path(
+        map_path,
+        gsfsc,
+        voxel_size_A=pixel_size,
+    )
 
     if display_map_path == map_path:
         display_vol = vol
@@ -1870,7 +2278,7 @@ def generate_report_pngs(
             if display_voxel is not None else spacing
         )
 
-    surface_threshold = choose_threshold(display_vol, user_threshold=threshold_value)
+    surface_threshold = choose_threshold(display_vol, user_threshold=threshold_value, mode="refine")
 
     # real-space slices
     save_slice_panel(
@@ -1880,6 +2288,7 @@ def generate_report_pngs(
         cmap=cmap,
         symmetric=True,
         manual_vmax=slice_vmax,
+        embed_title=embed_titles,
     )
 
     # stacked mask slices
@@ -1898,8 +2307,8 @@ def generate_report_pngs(
         save_stacked_mask_panel(
             mask_items=mask_items,
             out_path=outdir / f"mask_slices_iter{iteration:03d}.png",
-            title=f"Mask Slices Iteration {iteration:03d}",
             cmap=cmap,
+            title=None,
         )
 
     # surface views
@@ -1912,6 +2321,8 @@ def generate_report_pngs(
         spacing=display_spacing,
         panel_px=900,
         dpi=400,
+        embed_header=embed_titles,
+        embed_plane_labels=True,
     )
 
     # view lookup chart
@@ -1924,6 +2335,7 @@ def generate_report_pngs(
         spacing=display_spacing,
         panel_px=240,
         dpi=300,
+        embed_title=embed_titles,
     )
 
     # FSC
@@ -1938,6 +2350,7 @@ def generate_report_pngs(
             pixel_size_override=pixel_size,
             gsfsc_value=gsfsc,
             cmap=cmap,
+            embed_title=embed_titles,
         )
 
     # Guinier
@@ -1949,6 +2362,7 @@ def generate_report_pngs(
         pixel_size_override=pixel_size,
         cmap=cmap,
         gsfsc=gsfsc,
+        embed_title=embed_titles,
     )
 
     # Viewing direction / posterior precision + per-particle scale plots
@@ -1984,8 +2398,9 @@ def generate_report_pngs(
                 bin_equal_area=False,
                 log_scale=True,
                 cmap=cmap,
-                cbar_label="# of images (log scale)",
+                cbar_label="# images (log scale)",
                 use_inverse=False,
+                embed_title=embed_titles,
             )
         except Exception as e:
             print(f"[warn] viewing-direction plot skipped: {e}")
@@ -2006,11 +2421,12 @@ def generate_report_pngs(
                 freq_samples=24,
                 n_circle_samples=288,
                 particle_chunk=1024,
+                embed_title=embed_titles,
             )
         except Exception as e:
             print(f"[warn] posterior-precision plot skipped: {e}")
 
-    return iteration, pixel_size
+    return iteration, pixel_size, gsfsc, display_map_mode, display_map_reason, float(surface_threshold)
 
 
 def main():
@@ -2026,7 +2442,7 @@ def main():
     job_folder = Path(args.job_folder).resolve()
     outdir = Path(args.outdir).resolve() if args.outdir else (job_folder / "report_pngs")
 
-    iteration, pixel_size = generate_report_pngs(
+    iteration, pixel_size, _, _, _, _ = generate_report_pngs(
         job_folder=job_folder,
         outdir=outdir,
         pixel_size_override=args.pixel_size,

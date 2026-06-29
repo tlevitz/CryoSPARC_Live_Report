@@ -476,6 +476,8 @@ def parse_exposure(project_dir: str, session_name: str, exp: dict, bin_size_pix:
     dw = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "micrograph_blob", "path")
     non_dw = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "micrograph_blob_non_dw", "path")
 
+    movie_path = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "movie_blob", "path")
+
     ctf_diag = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "ctf_stats", "diag_image_path")
     ctf_1d = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "ctf_stats", "fit_data_path")
 
@@ -512,6 +514,7 @@ def parse_exposure(project_dir: str, session_name: str, exp: dict, bin_size_pix:
         "raw": exp,
         "uid": exp.get("uid"),
         "abs_file_path": exp.get("abs_file_path"),
+        "movie_path": movie_path,
         "thumb_path": thumb,
         "micrograph_path": dw,
         "micrograph_non_dw_path": non_dw,
@@ -751,15 +754,15 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
 
     if current_picker == "blob":
         picking_rows.extend([
-            ("Blob Diameter Min (A)", fmt_num(params.get("blob_diameter_min"), 1)),
-            ("Blob Diameter Max (A)", fmt_num(params.get("blob_diameter_max"), 1)),
+            ("Blob Diameter Min (A)", fmt_num(params.get("blob_diameter_min"), 0)),
+            ("Blob Diameter Max (A)", fmt_num(params.get("blob_diameter_max"), 0)),
             ("Blob Min Separation (diameters)", fmt_num(params.get("blob_min_distance"), 2)),
             ("Blob NCC Threshold Value", fmt_num(ncc_val, 3)),
 #            ("Blob NCC Threshold Min", fmt_num(ncc_min, 3)),
 #            ("Blob NCC Threshold Max", fmt_num(ncc_max, 3)),
             ("Blob Power Min", fmt_num(power_min, 3)),
             ("Blob Power Max", fmt_num(power_max, 3)),
-            ("Blob Lowpass (A)", fmt_num(params.get("blob_lowpass_res"), 1)),
+            ("Blob Lowpass (A)", fmt_num(params.get("blob_lowpass_res"), 0)),
 #            ("Blob Angular Spacing (deg)", fmt_num(params.get("blob_angular_spacing_deg"), 1)),
             ("Blob Max Num Hits", str(params.get("blob_max_num_hits", ""))),
             ("Total Blob Picks", str(stats.get("total_blob_picks", ""))),
@@ -770,7 +773,8 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
 
         picking_rows.extend([
             ("Template Source", f"{template_creation_project} {template_creation_job}"),
-            ("Template Lowpass (A)", fmt_num(params.get("template_lowpass_res"), 1)),
+            ("Template Lowpass (A)", fmt_num(params.get("template_lowpass_res"), 0)),
+            ("Template Diameter (A)", fmt_num(params.get("template_diameter"), 0)),
 #            ("Template Angular Spacing (deg)", fmt_num(params.get("template_angular_spacing_deg"), 1)),
             ("Template Max Num Hits", str(params.get("template_max_num_hits", ""))),
             ("Template Min Separation (diameters)", fmt_num(params.get("template_min_distance"), 2)),
@@ -804,12 +808,16 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
 
     # ---------------- 2D Classification ----------------
 
-    total_2d_accepted = str(ws.get("phase2_class2D_num_particles_accepted", ""))
-    total_2d = str(ws.get("phase2_class2D_num_particles_in", ""))
+    total_2d_accepted = int(ws.get("phase2_class2D_num_particles_accepted") or 0)
+    total_2d = int(ws.get("phase2_class2D_num_particles_in") or 0)
 
-    selected_2d_particles = str(class2d["selected_particles"])
-    rejected_2d_particles = str(class2d["rejected_particles"])
-    total_classified = (selected_2d_particles + rejected_2d_particles)
+    class2d_info_rows = ws.get("phase2_class2D_info") or []
+    total_classified = 0
+    for row in class2d_info_rows:
+        try:
+            total_classified += int(row.get("num_particles_total") or 0)
+        except Exception:
+            pass
 
     class2d_summary_html = (
         f'<font color="#3182bd"><b>Classes:</b> {class2d["total_classes"]}</font>'
@@ -834,7 +842,7 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
 
     class2d_rows.extend([
         ("2D Window Inner (A)", fmt_num(window_inner_A, 1)),
-        ("Particles Classified", total_classified),
+        ("Particles Classified", str(total_classified)),
 #        ("2D Particles Accepted", str(ws.get("phase2_class2D_num_particles_accepted", ""))),
 #        ("2D Particles Rejected", str(ws.get("phase2_class2D_num_particles_rejected", ""))),
         ("2D Last Updated", fmt_dt(json_date_to_dt(ws.get("phase2_class2D_last_updated")))),

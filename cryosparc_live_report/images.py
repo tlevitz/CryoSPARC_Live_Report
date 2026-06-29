@@ -4,7 +4,9 @@
 import io
 import math
 from io import BytesIO
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable, Union
+
+AlphaLike = Union[int, Callable[[object, int, int], int]]
 
 import matplotlib
 matplotlib.use("Agg")
@@ -23,6 +25,10 @@ try:
 except Exception:
     Dataset = None
 
+try:
+    from .stats import get_picking_threshold, get_threshold_block
+except Exception:
+    pass
 
 try:
     RESAMPLE = Image.Resampling.LANCZOS
@@ -102,14 +108,34 @@ def pad_tile_to_square(img: Image.Image, tile_size: int, bg="white") -> Image.Im
     return canvas
 
 
+def trim_uniform_background(img: Image.Image, bg_color=None, pad: int = 0) -> Image.Image:
+    rgb = img.convert("RGB")
+    arr = np.asarray(rgb)
+
+    if bg_color is None:
+        bg_color = tuple(arr[0, 0].tolist())
+
+    bg = np.array(bg_color, dtype=arr.dtype)
+    mask = np.any(arr != bg, axis=2)
+
+    if not np.any(mask):
+        return img
+
+    ys, xs = np.where(mask)
+    x0 = max(0, int(xs.min()) - pad)
+    x1 = min(img.width, int(xs.max()) + 1 + pad)
+    y0 = max(0, int(ys.min()) - pad)
+    y1 = min(img.height, int(ys.max()) + 1 + pad)
+
+    return img.crop((x0, y0, x1, y1))
+
+
 def load_mrc(path: str) -> np.ndarray:
     with mrcfile.open(path, permissive=True) as m:
         return np.asarray(m.data)
 
+
 def merge_nested_dicts(defaults: dict, user: Optional[dict]) -> dict:
-    """
-    Shallow merge at top level, and one level deep for nested dict values.
-    """
     out = dict(defaults)
     if not user:
         return out
@@ -122,6 +148,19 @@ def merge_nested_dicts(defaults: dict, user: Optional[dict]) -> dict:
         else:
             out[k] = v
     return out
+
+
+def _require_cfg_keys(name: str, cfg: dict, keys: list):
+    missing = [k for k in keys if k not in cfg]
+    if missing:
+        raise KeyError(f"{name} missing required keys: {', '.join(missing)}")
+
+
+def _rgb_to_mpl(color):
+    if isinstance(color, str):
+        return color
+    return tuple((float(c) / 255.0) if float(c) > 1.0 else float(c) for c in color)
+
 
 def normalize_stack(arr: np.ndarray) -> np.ndarray:
     if arr.ndim != 3:
@@ -592,69 +631,237 @@ def add_plot_style_title_band(
     title_h: int = 20,
     y_pad: int = 2,
     bg=(255, 255, 255),
+    text_color=(20, 20, 20),
+    font_weight="normal",
+    dpi: int = 100,
 ) -> Image.Image:
-    W, H = canvas_size
-    out = Image.new("RGB", (W, H), bg)
-    d = ImageDraw.Draw(out)
-    font = load_font(font_size, bold=False)
+    W, H = [int(v) for v in canvas_size]
+    if W <= 1 or H <= 1:
+        return img.convert("RGB")
 
-    try:
-        bbox = d.textbbox((0, 0), title, font=font)
-        tw = bbox[2] - bbox[0]
-    except Exception:
-        tw = d.textsize(title, font=font)[0]
+    fig_w = W / float(dpi)
+    fig_h = H / float(dpi)
 
-    tx = (W - tw) // 2
-    ty = y_pad
-    d.text((tx, ty), title, fill=(20, 20, 20), font=font)
+    title_h = max(int(title_h), int(round(font_size * 2.0)))
+    title_frac = min(0.40, max(0.08, title_h / float(H)))
 
-    avail_h = max(1, H - title_h)
-    inner = fit_within(img, W, avail_h)
-    ix = (W - inner.width) // 2
-    iy = title_h + (avail_h - inner.height) // 2
-    out.paste(inner.convert("RGB"), (ix, iy))
+    bg_rgb = _rgb_to_mpl(bg)
+    text_rgb = _rgb_to_mpl(text_color)
+
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+    fig.patch.set_facecolor(bg_rgb)
+
+    ax_title = fig.add_axes([0.0, 1.0 - title_frac, 1.0, title_frac], facecolor=bg_rgb)
+    ax_title.set_axis_off()
+
+    title_band_px = max(1.0, title_frac * H)
+    y_shift = float(y_pad) / title_band_px
+
+    ax_title.text(
+        0.5,
+        0.5 - y_shift,
+        title,
+        ha="center",
+        va="center",
+        fontsize=font_size,
+        fontweight=font_weight,
+        color=text_rgb,
+        transform=ax_title.transAxes,
+    )
+
+    ax_img = fig.add_axes([0.0, 0.0, 1.0, 1.0 - title_frac], facecolor=bg_rgb)
+    ax_img.set_axis_off()
+    ax_img.set_anchor("C")
+
+    np_img = np.asarray(img.convert("RGB"))
+    ax_img.imshow(np_img, interpolation="nearest")
+    ax_img.set_aspect("equal")
+
+    out = mplfig_to_pil(fig)
+    if out.size != (W, H):
+        out = out.resize((W, H), RESAMPLE)
     return out
 
+def _as_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
 
-def overlay_blob_picks(base_img: Image.Image, pick_cs_path: Optional[str], max_draw: int = 4000) -> Image.Image:
-    img = base_img.convert("RGB")
+def get_pick_overlay_params(ws: dict, exp: dict) -> dict:
+    params = ws.get("params", {}) or {}
+    stats = ws.get("stats", {}) or {}
+
+    picker_type = (
+        exp.get("pick_picker_type")
+        or exp.get("picker_type")
+        or str(params.get("current_picker") or "").strip().lower()
+        or None
+    )
+
+    source_micrograph_shape = None
+    try:
+        nx = stats.get("nx")
+        ny = stats.get("ny")
+        if nx is not None and ny is not None:
+            source_micrograph_shape = (int(nx), int(ny))
+    except Exception:
+        source_micrograph_shape = None
+
+    picker = str(picker_type or "").strip().lower()
+
+    ncc_min = ncc_val = ncc_max = None
+    power_min = power_max = None
+
+    if picker:
+        ncc_min, ncc_val, ncc_max = get_picking_threshold(ws, f"{picker}_ncc_score")
+        power_block = get_threshold_block(ws, f"{picker}_power") or {}
+        power_min = power_block.get("min")
+        power_max = power_block.get("max")
+
+    return {
+        "picker_type": picker_type,
+        "micrograph_psize_A": exp.get("micrograph_psize_A") or params.get("psize_A"),
+        "source_micrograph_shape": source_micrograph_shape,
+        "blob_diameter_max_A": params.get("blob_diameter_max"),
+        "template_diameter_A": params.get("template_diameter"),
+        "gainref_flip_y": _as_bool(params.get("gainref_flip_y")),
+        "ncc_threshold": ncc_val,
+        "power_min": power_min,
+        "power_max": power_max,
+    }
+
+def overlay_blob_picks(
+    base_img: Image.Image,
+    pick_cs_path: Optional[str],
+    *,
+    picker_type: Optional[str] = None,
+    micrograph_psize_A: Optional[float] = None,
+    source_micrograph_shape: Optional[Tuple[int, int]] = None,
+    blob_diameter_max_A: Optional[float] = None,
+    template_diameter_A: Optional[float] = None,
+    gainref_flip_y: bool = False,
+    ncc_threshold: Optional[float] = None,
+    power_min: Optional[float] = None,
+    power_max: Optional[float] = None,
+    max_draw: int = 4000,
+    outline_rgba: Tuple[int, int, int, int] = (0, 0, 255, 255),
+    fill_rgb: Tuple[int, int, int] = (0, 0, 255),
+    fill_alpha: AlphaLike = 0,
+    line_w: int = 6,
+) -> Image.Image:
+    img = base_img.convert("RGBA")
     if not pick_cs_path or Dataset is None:
-        return img
+        return img.convert("RGB")
 
     try:
         ds = Dataset.load(pick_cs_path)
         n = len(ds)
         if n == 0:
-            return img
+            return img.convert("RGB")
 
         w, h = img.size
-        draw = ImageDraw.Draw(img)
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
 
-        step = max(1, int(math.ceil(n / max_draw)))
-        radius = max(2, int(round(min(w, h) / 220.0)))
-        line_w = 2
+        picker = str(picker_type or "").strip().lower()
+        diameter_A = None
+        if picker == "blob":
+            diameter_A = blob_diameter_max_A
+        elif picker == "template":
+            diameter_A = template_diameter_A
 
-        for i in range(0, n, step):
+        rx = ry = None
+        if (
+            diameter_A is not None
+            and micrograph_psize_A is not None
+            and micrograph_psize_A > 0
+        ):
+            diameter_src_pix = float(diameter_A) / float(micrograph_psize_A)
+
+            if source_micrograph_shape is not None:
+                src_w, src_h = source_micrograph_shape
+                if src_w and src_h:
+                    scale_x = w / float(src_w)
+                    scale_y = h / float(src_h)
+                else:
+                    scale_x = scale_y = 1.0
+            else:
+                scale_x = scale_y = 1.0
+
+            rx = max(2.0, 0.5 * diameter_src_pix * scale_x)
+            ry = max(2.0, 0.5 * diameter_src_pix * scale_y)
+
+        if rx is None or ry is None:
+            fallback_r = max(2, int(round(min(w, h) / 110.0)))
+            rx = ry = float(fallback_r)
+
+        # First collect rows that pass thresholds
+        rows_to_draw = []
+        has_ncc = "pick_stats/ncc_score" in ds.fields()
+        has_power = "pick_stats/power" in ds.fields()
+
+        for i in range(n):
             row = ds[i]
+
+            if ncc_threshold is not None and has_ncc:
+                try:
+                    if float(row["pick_stats/ncc_score"]) < float(ncc_threshold):
+                        continue
+                except Exception:
+                    continue
+
+            if power_min is not None and has_power:
+                try:
+                    if float(row["pick_stats/power"]) < float(power_min):
+                        continue
+                except Exception:
+                    continue
+
+            if power_max is not None and has_power:
+                try:
+                    if float(row["pick_stats/power"]) > float(power_max):
+                        continue
+                except Exception:
+                    continue
+
+            rows_to_draw.append((i, row))
+
+        if not rows_to_draw:
+            return img.convert("RGB")
+
+        step = max(1, int(math.ceil(len(rows_to_draw) / max_draw)))
+
+        for j in range(0, len(rows_to_draw), step):
+            i, row = rows_to_draw[j]
+
             x = float(row["location/center_x_frac"]) * w
-            y = float(1.0 - row["location/center_y_frac"]) * h
+            y_frac = float(row["location/center_y_frac"])
+            y = (y_frac if gainref_flip_y else (1.0 - y_frac)) * h
+
+            if callable(fill_alpha):
+                a = int(fill_alpha(row, i, len(rows_to_draw)))
+            else:
+                a = int(fill_alpha)
+            a = max(0, min(255, a))
+
             draw.ellipse(
-                (x - radius, y - radius, x + radius, y + radius),
-                outline=(50, 230, 70),
+                (x - rx, y - ry, x + rx, y + ry),
+                fill=(fill_rgb[0], fill_rgb[1], fill_rgb[2], a),
+                outline=outline_rgba,
                 width=line_w,
             )
-        return img
-    except Exception:
-        return img
 
+        out = Image.alpha_composite(img, overlay)
+        return out.convert("RGB")
+
+    except Exception:
+        return base_img.convert("RGB")
 
 def spline_interp(gridshape, spl, pix):
-    """
-    gridshape: (N_Z, ny, nx) of the raw movie
-    spl: spline lattice for one coordinate component, shape (K_Z, K_Y, K_X)
-    pix: coordinates shaped (3, ...)
-         axis 0 = z(frame), axis 1 = y, axis 2 = x
-    """
     K_Z, K_Y, K_X = spl.shape
     mz, my, mx = gridshape
 
@@ -677,13 +884,6 @@ def spline_interp(gridshape, spl, pix):
 
 
 def spline_interp_traj(gridshape, splxy, pos):
-    """
-    gridshape: (N_Z, ny, nx)
-    splxy: shape (2, K_Z, K_Y, K_X)
-    pos: array of particle/patch positions, shape (N_P, 2), as (x, y) in raw movie pixels
-
-    returns: trajectories shape (N_P, N_Z, 2)
-    """
     mz, my, mx = gridshape
     N_P = pos.shape[0]
 
@@ -956,40 +1156,44 @@ def _first_threshold_crossing_x(x, y, thr=0.3, smooth_window=7):
             return float(x0 + t * (x1 - x0))
     return None
 
+
 def plot_ctf_1d_to_pil(
     ctf_1d_path: str,
     size=(420, 220),
     exp: Optional[dict] = None,
-    render_scale: int = 3,
     cfg: Optional[dict] = None,
 ) -> Image.Image:
-    defaults = {
-        "threshold": 0.3,
-        "smooth_window": 7,
-        "dpi": 100,
-        "render_scale": render_scale,
-        "facecolor": "white",
-        "ps_color": "black",
-        "ctf_color": "#de2d26",
-        "fit_color": "#3182bd",
-        "threshold_line_color": "#31a354",
-        "grid_color": "0.93",
-        "refline_color": "0.88",
-        "ps_lw": 1.35,
-        "ctf_lw": 1.15,
-        "fit_lw": 1.10,
-        "threshold_lw": 1.1,
-        "xlabel_fontsize": 8,
-        "ylabel_fontsize": 8,
-        "tick_labelsize": 7,
-        "title_fontsize": 7.5,
-        "legend_fontsize": 6.5,
-        "top_axis_fontsize": 8,
-        "top_tick_fontsize": 7,
-        "tight_pad": 0.35,
-        "resolution_ticks_A": [20, 15, 10, 8, 6, 5, 4, 3],
-    }
-    cfg = merge_nested_dicts(defaults, cfg)
+    cfg = dict(cfg or {})
+    _require_cfg_keys(
+        "ctf_1d cfg",
+        cfg,
+        [
+            "threshold",
+            "smooth_window",
+            "dpi",
+            "render_scale",
+            "facecolor",
+            "ps_color",
+            "ctf_color",
+            "fit_color",
+            "threshold_line_color",
+            "grid_color",
+            "refline_color",
+            "ps_lw",
+            "ctf_lw",
+            "fit_lw",
+            "threshold_lw",
+            "xlabel_fontsize",
+            "ylabel_fontsize",
+            "tick_labelsize",
+            "title_fontsize",
+            "legend_fontsize",
+            "top_axis_fontsize",
+            "top_tick_fontsize",
+            "tight_pad",
+            "resolution_ticks_A",
+        ],
+    )
 
     try:
         arr = np.load(ctf_1d_path, allow_pickle=True)
@@ -1016,18 +1220,6 @@ def plot_ctf_1d_to_pil(
             thr=cfg["threshold"],
             smooth_window=cfg["smooth_window"],
         )
-        fit_cross_A = None
-        if fit_cross_x is not None and fit_cross_x > 1e-8:
-            fit_cross_A = 1.0 / float(fit_cross_x)
-
-        df1_A = _get_exp_raw_nested(exp or {}, "groups", "exposure", "ctf", "df1_A", default=None)
-        df2_A = _get_exp_raw_nested(exp or {}, "groups", "exposure", "ctf", "df2_A", default=None)
-        angast = _get_exp_raw_nested(exp or {}, "groups", "exposure", "ctf", "df_angle_rad", default=None)
-        phase = _get_exp_raw_nested(exp or {}, "groups", "exposure", "ctf", "phase_shift_rad", default=None)
-
-        fit_A = exp.get("ctf_fit_A") if isinstance(exp, dict) else None
-        if fit_A is None:
-            fit_A = fit_cross_A
 
         render_scale = max(1, int(cfg["render_scale"]))
         fig_w = max(2.0, size[0] / float(cfg["dpi"]))
@@ -1069,21 +1261,9 @@ def plot_ctf_1d_to_pil(
             ax2.set_xlim(ax.get_xlim())
             ax2.set_xticks(tick_pos)
             ax2.set_xticklabels(tick_lab, fontsize=cfg["top_tick_fontsize"])
-            ax2.set_xlabel("Resolution (Å)", fontsize=cfg["top_axis_fontsize"])
+            ax2.set_xlabel("Resolution (Å)", fontsize=cfg["top_axis_fontsize"], loc="left")
 
-        title_bits = ["1D CTF | "]
-        if df1_A is not None:
-            title_bits.append(f"DF1 {float(df1_A):.0f} | ")
-        if df2_A is not None:
-            title_bits.append(f"DF2 {float(df2_A):.0f} | ")
-        if angast is not None:
-            title_bits.append(f"ANGAST {float(angast):.3f} | ")
-        if phase is not None:
-            title_bits.append(f"PHASE {float(phase):.3f} | ")
-        if fit_A is not None:
-            title_bits.append(f"FIT {float(fit_A):.2f} Å")
-
-        ax.set_title("".join(title_bits), fontsize=cfg["title_fontsize"], pad=2.5)
+        ax.set_title("1D CTF", fontsize=cfg["title_fontsize"], pad=2.5)
         ax.legend(
             loc="upper right",
             fontsize=cfg["legend_fontsize"],
@@ -1122,23 +1302,27 @@ def plot_global_motion_to_pil(
     zero_shift_frame: Optional[int] = None,
     cfg: Optional[dict] = None,
 ) -> Image.Image:
-    defaults = {
-        "title": "Global motion",
-        "dpi": 100,
-        "line_color": "#6a51a3",
-        "line_width": 1.2,
-        "start_marker_ms": 2.0,
-        "grid_color": "0.93",
-        "grid_lw": 0.6,
-        "axis_line_color": "0.88",
-        "axis_line_lw": 0.8,
-        "title_fontsize": 8,
-        "tick_labelsize": 6,
-        "tight_pad": 0.15,
-        "facecolor": "white",
-        "subtract_zero_frame": True,
-    }
-    cfg = merge_nested_dicts(defaults, cfg)
+    cfg = dict(cfg or {})
+    _require_cfg_keys(
+        "global_motion cfg",
+        cfg,
+        [
+            "title",
+            "dpi",
+            "line_color",
+            "line_width",
+            "start_marker_ms",
+            "grid_color",
+            "grid_lw",
+            "axis_line_color",
+            "axis_line_lw",
+            "title_fontsize",
+            "tick_labelsize",
+            "tight_pad",
+            "facecolor",
+            "subtract_zero_frame",
+        ],
+    )
 
     try:
         traj = np.load(rigid_motion_path, allow_pickle=True)
@@ -1167,27 +1351,14 @@ def plot_global_motion_to_pil(
         fig.patch.set_facecolor(cfg["facecolor"])
         ax.set_facecolor(cfg["facecolor"])
 
-        ax.plot(
-            x,
-            y,
-            color=cfg["line_color"],
-            lw=cfg["line_width"],
-            zorder=2,
-        )
-        ax.plot(
-            x[0],
-            y[0],
-            "o",
-            ms=cfg["start_marker_ms"],
-            color=cfg["line_color"],
-            zorder=3,
-        )
+        ax.plot(x, y, color=cfg["line_color"], lw=cfg["line_width"], zorder=2)
+        ax.plot(x[0], y[0], "o", ms=cfg["start_marker_ms"], color=cfg["line_color"], zorder=3)
 
         ax.axhline(0, color=cfg["axis_line_color"], lw=cfg["axis_line_lw"], zorder=0)
         ax.axvline(0, color=cfg["axis_line_color"], lw=cfg["axis_line_lw"], zorder=0)
         ax.grid(True, color=cfg["grid_color"], lw=cfg["grid_lw"])
 
-        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_aspect("auto")
         ax.set_title(cfg["title"], fontsize=cfg["title_fontsize"], pad=2)
         ax.tick_params(axis="both", labelsize=cfg["tick_labelsize"])
 
@@ -1197,33 +1368,38 @@ def plot_global_motion_to_pil(
     except Exception as e:
         return make_placeholder(size=size, text=f"Global motion unavailable\n{e}")
 
+
 def plot_local_motion_to_pil(
     spline_motion_path: str,
     size=(420, 220),
-    movie_shape: Optional[tuple] = None,   # (N_Z, ny, nx)
+    movie_shape: Optional[tuple] = None,
     angpix_A: Optional[float] = None,
     rigid_motion_path: Optional[str] = None,
     cfg: Optional[dict] = None,
 ) -> Image.Image:
-    defaults = {
-        "title": "Local motion",
-        "dpi": 100,
-        "patch_spacing_A": 380.0,
-        "patch_size_A": 500.0,
-        "viewer_scale": 40.0,
-        "grid_color": "0.88",
-        "grid_lw": 0.7,
-        "traj_lw": 1.0,
-        "traj_alpha": 0.95,
-        "start_marker_ms": 1.8,
-        "row_cmap": "viridis",
-        "row_cmap_min": 0.10,
-        "row_cmap_max": 0.90,
-        "title_fontsize": 8,
-        "facecolor": "white",
-        "tight_pad": 0.15,
-    }
-    cfg = merge_nested_dicts(defaults, cfg)
+    cfg = dict(cfg or {})
+    _require_cfg_keys(
+        "local_motion cfg",
+        cfg,
+        [
+            "title",
+            "dpi",
+            "patch_spacing_A",
+            "patch_size_A",
+            "viewer_scale",
+            "grid_color",
+            "grid_lw",
+            "traj_lw",
+            "traj_alpha",
+            "start_marker_ms",
+            "row_cmap",
+            "row_cmap_min",
+            "row_cmap_max",
+            "title_fontsize",
+            "facecolor",
+            "tight_pad",
+        ],
+    )
 
     try:
         splxy = np.load(spline_motion_path, allow_pickle=True)
@@ -1295,23 +1471,8 @@ def plot_local_motion_to_pil(
             py = base_y - cfg["viewer_scale"] * (ts_rel[p, :, 1] / cell_h_pix)
 
             traj_color = row_colors[iy]
-            ax.plot(
-                px,
-                py,
-                color=traj_color,
-                lw=cfg["traj_lw"],
-                alpha=cfg["traj_alpha"],
-                zorder=2,
-            )
-            ax.plot(
-                px[0],
-                py[0],
-                "o",
-                ms=cfg["start_marker_ms"],
-                color=traj_color,
-                alpha=cfg["traj_alpha"],
-                zorder=3,
-            )
+            ax.plot(px, py, color=traj_color, lw=cfg["traj_lw"], alpha=cfg["traj_alpha"], zorder=2)
+            ax.plot(px[0], py[0], "o", ms=cfg["start_marker_ms"], color=traj_color, alpha=cfg["traj_alpha"], zorder=3)
 
         ax.set_xlim(0, npx)
         ax.set_ylim(npy, 0)
@@ -1326,38 +1487,43 @@ def plot_local_motion_to_pil(
     except Exception as e:
         return make_placeholder(size=size, text=f"Local motion unavailable\n{e}")
 
+
 def plot_ctf_defocus_landscape_to_pil(
     ctf_spline_path: str,
     size=(220, 220),
-    micrograph_shape: Optional[Tuple[int, int]] = None,   # (ny, nx)
+    micrograph_shape: Optional[Tuple[int, int]] = None,
     cfg: Optional[dict] = None,
 ) -> Image.Image:
-    defaults = {
-        "title": "Local Defocus",
-        "dpi": 100,
-        "display_grid": 180,
-        "mode": "nearest",
-        "elev": 28,
-        "azim": -58,
-        "cmap": "viridis",
-        "z_half_range_A": 2500.0,
-        "facecolor": "white",
-        "xlabel": "X (pix)",
-        "ylabel": "Y (pix)",
-        "zlabel": "Defocus (µm)",
-        "axis_label_fontsize": 6,
-        "title_fontsize": 8,
-        "tick_labelsize": 5,
-        "box_aspect": (1.0, 1.0, 0.55),
-        "colorbar": True,
-        "colorbar_shrink": 0.62,
-        "colorbar_pad": 0.05,
-        "colorbar_fraction": 0.05,
-        "colorbar_label": "Mean defocus (µm)",
-        "colorbar_label_fontsize": 6,
-        "tight_pad": 0.2,
-    }
-    cfg = merge_nested_dicts(defaults, cfg)
+    cfg = dict(cfg or {})
+    _require_cfg_keys(
+        "local_defocus cfg",
+        cfg,
+        [
+            "title",
+            "dpi",
+            "display_grid",
+            "mode",
+            "elev",
+            "azim",
+            "cmap",
+            "z_half_range_A",
+            "facecolor",
+            "xlabel",
+            "ylabel",
+            "zlabel",
+            "axis_label_fontsize",
+            "title_fontsize",
+            "tick_labelsize",
+            "box_aspect",
+            "colorbar",
+            "colorbar_shrink",
+            "colorbar_pad",
+            "colorbar_fraction",
+            "colorbar_label",
+            "colorbar_label_fontsize",
+            "tight_pad",
+        ],
+    )
 
     try:
         arr = load_ctf_spline(ctf_spline_path)
@@ -1420,22 +1586,23 @@ def plot_ctf_defocus_landscape_to_pil(
         except Exception:
             pass
 
-#        if cfg["colorbar"]:
-#            cbar = fig.colorbar(
-#                surf,
-#                ax=ax,
-#                shrink=cfg["colorbar_shrink"],
-#                pad=cfg["colorbar_pad"],
-#                fraction=cfg["colorbar_fraction"],
-#            )
-#            cbar.ax.tick_params(labelsize=cfg["tick_labelsize"])
-#            cbar.set_label(cfg["colorbar_label"], fontsize=cfg["colorbar_label_fontsize"])
+        if cfg["colorbar"]:
+            cbar = fig.colorbar(
+                surf,
+                ax=ax,
+                shrink=cfg["colorbar_shrink"],
+                pad=cfg["colorbar_pad"],
+                fraction=cfg["colorbar_fraction"],
+            )
+            cbar.ax.tick_params(labelsize=cfg["tick_labelsize"])
+            cbar.set_label(cfg["colorbar_label"], fontsize=cfg["colorbar_label_fontsize"])
 
         fig.tight_layout(pad=cfg["tight_pad"])
         return mplfig_to_pil(fig)
 
     except Exception as e:
         return make_placeholder(size=size, text=f"Local defocus unavailable\n{e}")
+
 
 def normalize_curve_01(arr: np.ndarray) -> np.ndarray:
     a = np.asarray(arr, dtype=np.float32)
@@ -1452,13 +1619,8 @@ def normalize_curve_01(arr: np.ndarray) -> np.ndarray:
     out = (a - lo) / max(hi - lo, 1e-8)
     return np.clip(out, 0.0, 1.0)
 
+
 def particle_lowpass_for_display(img: np.ndarray) -> np.ndarray:
-    """
-    Match the recommended particle-display style:
-      - low-pass with scikit-image Butterworth
-      - cutoff_frequency_ratio = 6 / N
-      - order = 1
-    """
     a = np.asarray(img, dtype=np.float32)
     a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -1480,10 +1642,11 @@ def particle_lowpass_for_display(img: np.ndarray) -> np.ndarray:
     )
     return np.asarray(out, dtype=np.float32)
 
+
 def _particle_imshow_kwargs(
     img: np.ndarray,
     invert: bool = False,
-    autoscale: str = "imshow",   # "imshow", "minmax", or "percentile"
+    autoscale: str = "imshow",
     p_lo: float = 0.5,
     p_hi: float = 99.5,
 ):
@@ -1505,22 +1668,33 @@ def _particle_imshow_kwargs(
 
 def load_particle_stack_montage_matplotlib(
     stack_path: str,
-    sample_n: int = 12,
-    cols: int = 4,
-    tile_inches: float = 2.0,
-    dpi: int = 100,
-    invert: bool = False,
-    autoscale: str = "imshow",   # "imshow", "minmax", or "percentile"
-    p_lo: float = 0.5,
-    p_hi: float = 99.5,
-    wspace: float = 0.1,
-    hspace: float = 0.1,
-    add_indices: bool = False,
+    cfg: dict,
 ) -> Optional[Image.Image]:
-    """
-    Render a particle montage using Matplotlib subplots, with display matched
-    more closely to the recommended Butterworth-filtered imshow style.
-    """
+    _require_cfg_keys(
+        "particles cfg",
+        cfg,
+        [
+            "sample_n",
+            "cols",
+            "tile_inches",
+            "dpi",
+            "invert",
+            "autoscale",
+            "p_lo",
+            "p_hi",
+            "wspace",
+            "hspace",
+            "add_indices",
+            "facecolor",
+            "index_fontsize",
+            "index_color",
+            "index_bbox_facecolor",
+            "index_bbox_alpha",
+            "index_bbox_pad",
+            "index_bbox_edgecolor",
+        ],
+    )
+
     try:
         arr = load_mrc(stack_path)
         arr = normalize_stack(arr)
@@ -1528,22 +1702,29 @@ def load_particle_stack_montage_matplotlib(
         if arr.ndim != 3 or arr.shape[0] == 0:
             return None
 
-        idxs = sample_indices_evenly(arr.shape[0], sample_n)
+        idxs = sample_indices_evenly(arr.shape[0], int(cfg["sample_n"]))
         if not idxs:
             return None
 
-        cols = max(1, int(cols))
+        cols = max(1, int(cfg["cols"]))
         rows = int(math.ceil(len(idxs) / cols))
 
         fig, axs = plt.subplots(
             rows,
             cols,
-            figsize=(cols * tile_inches, rows * tile_inches),
-            dpi=dpi,
+            figsize=(cols * float(cfg["tile_inches"]), rows * float(cfg["tile_inches"])),
+            dpi=int(cfg["dpi"]),
             squeeze=False,
         )
-        fig.patch.set_facecolor("white")
-        plt.subplots_adjust(wspace=wspace, hspace=hspace)
+        fig.patch.set_facecolor(cfg["facecolor"])
+        plt.subplots_adjust(
+            left=0.02,
+            right=0.98,
+            bottom=0.02,
+            top=0.98,
+            wspace=cfg["wspace"],
+            hspace=cfg["hspace"]
+        )
 
         flat_axes = axs.ravel()
 
@@ -1554,15 +1735,15 @@ def load_particle_stack_montage_matplotlib(
             img = particle_lowpass_for_display(arr[idx])
             kw = _particle_imshow_kwargs(
                 img,
-                invert=invert,
-                autoscale=autoscale,
-                p_lo=p_lo,
-                p_hi=p_hi,
+                invert=cfg["invert"],
+                autoscale=cfg["autoscale"],
+                p_lo=cfg["p_lo"],
+                p_hi=cfg["p_hi"],
             )
 
             flat_axes[k].imshow(img, origin="upper", **kw)
 
-            if add_indices:
+            if cfg["add_indices"]:
                 flat_axes[k].text(
                     0.03,
                     0.97,
@@ -1570,9 +1751,14 @@ def load_particle_stack_montage_matplotlib(
                     transform=flat_axes[k].transAxes,
                     ha="left",
                     va="top",
-                    fontsize=8,
-                    color="yellow",
-                    bbox=dict(facecolor="black", alpha=0.35, pad=1.5, edgecolor="none"),
+                    fontsize=cfg["index_fontsize"],
+                    color=cfg["index_color"],
+                    bbox=dict(
+                        facecolor=cfg["index_bbox_facecolor"],
+                        alpha=cfg["index_bbox_alpha"],
+                        pad=cfg["index_bbox_pad"],
+                        edgecolor=cfg["index_bbox_edgecolor"],
+                    ),
                 )
 
         return mplfig_to_pil(fig)
@@ -1581,32 +1767,45 @@ def load_particle_stack_montage_matplotlib(
         print(f"Warning: failed particle montage for {stack_path}: {e}")
         return None
 
+
 def load_particle_multi_stack_montage_matplotlib(
     stack_paths: List[str],
     row_labels: Optional[List[str]] = None,
-    per_stack: int = 6,
-    max_stacks: int = 6,
-    tile_inches: float = 1.8,
-    dpi: int = 100,
-    invert: bool = False,
-    autoscale: str = "imshow",   # "imshow", "minmax", or "percentile"
-    p_lo: float = 0.5,
-    p_hi: float = 99.5,
-    wspace: float = 0.08,
-    hspace: float = 0.08,
-    left_margin: float = 0.14,
-    add_indices: bool = False,
+    cfg: Optional[dict] = None,
 ) -> Optional[Image.Image]:
-    """
-    Render multiple particle stacks as a Matplotlib montage:
-      - one row per stack
-      - Butterworth low-pass particle display
-      - row labels on the left
-    """
+    cfg = dict(cfg or {})
+    _require_cfg_keys(
+        "particle multi cfg",
+        cfg,
+        [
+            "per_stack",
+            "max_stacks",
+            "tile_inches",
+            "dpi",
+            "invert",
+            "autoscale",
+            "p_lo",
+            "p_hi",
+            "wspace",
+            "hspace",
+            "left_margin",
+            "add_indices",
+            "facecolor",
+            "index_fontsize",
+            "index_color",
+            "index_bbox_facecolor",
+            "index_bbox_alpha",
+            "index_bbox_pad",
+            "index_bbox_edgecolor",
+            "row_label_fontsize",
+            "row_label_color",
+        ],
+    )
+
     row_labels = row_labels or []
     rows_data = []
 
-    for i, stack_path in enumerate(stack_paths[:max_stacks]):
+    for i, stack_path in enumerate(stack_paths[:int(cfg["max_stacks"])]):
         try:
             arr = load_mrc(stack_path)
             arr = normalize_stack(arr)
@@ -1614,7 +1813,7 @@ def load_particle_multi_stack_montage_matplotlib(
             if arr.ndim != 3 or arr.shape[0] == 0:
                 continue
 
-            idxs = sample_indices_evenly(arr.shape[0], per_stack)
+            idxs = sample_indices_evenly(arr.shape[0], int(cfg["per_stack"]))
             if not idxs:
                 continue
 
@@ -1635,18 +1834,18 @@ def load_particle_multi_stack_montage_matplotlib(
     fig, axs = plt.subplots(
         n_rows,
         n_cols,
-        figsize=(n_cols * tile_inches, n_rows * tile_inches),
-        dpi=dpi,
+        figsize=(n_cols * float(cfg["tile_inches"]), n_rows * float(cfg["tile_inches"])),
+        dpi=int(cfg["dpi"]),
         squeeze=False,
     )
-    fig.patch.set_facecolor("white")
+    fig.patch.set_facecolor(cfg["facecolor"])
     plt.subplots_adjust(
-        left=left_margin,
+        left=cfg["left_margin"],
         right=0.99,
         top=0.99,
         bottom=0.01,
-        wspace=wspace,
-        hspace=hspace,
+        wspace=cfg["wspace"],
+        hspace=cfg["hspace"],
     )
 
     for r in range(n_rows):
@@ -1661,14 +1860,14 @@ def load_particle_multi_stack_montage_matplotlib(
                 img = particle_lowpass_for_display(arr[idx])
                 kw = _particle_imshow_kwargs(
                     img,
-                    invert=invert,
-                    autoscale=autoscale,
-                    p_lo=p_lo,
-                    p_hi=p_hi,
+                    invert=cfg["invert"],
+                    autoscale=cfg["autoscale"],
+                    p_lo=cfg["p_lo"],
+                    p_hi=cfg["p_hi"],
                 )
                 ax.imshow(img, origin="upper", **kw)
 
-                if add_indices:
+                if cfg["add_indices"]:
                     ax.text(
                         0.03,
                         0.97,
@@ -1676,12 +1875,16 @@ def load_particle_multi_stack_montage_matplotlib(
                         transform=ax.transAxes,
                         ha="left",
                         va="top",
-                        fontsize=7,
-                        color="yellow",
-                        bbox=dict(facecolor="black", alpha=0.35, pad=1.2, edgecolor="none"),
+                        fontsize=cfg["index_fontsize"],
+                        color=cfg["index_color"],
+                        bbox=dict(
+                            facecolor=cfg["index_bbox_facecolor"],
+                            alpha=cfg["index_bbox_alpha"],
+                            pad=cfg["index_bbox_pad"],
+                            edgecolor=cfg["index_bbox_edgecolor"],
+                        ),
                     )
 
-        # Put row label on the first axis in the row
         axs[r, 0].text(
             -0.08,
             0.5,
@@ -1689,11 +1892,54 @@ def load_particle_multi_stack_montage_matplotlib(
             transform=axs[r, 0].transAxes,
             ha="right",
             va="center",
-            fontsize=10,
-            color="black",
+            fontsize=cfg["row_label_fontsize"],
+            color=cfg["row_label_color"],
         )
 
     return mplfig_to_pil(fig)
+
+
+def make_particle_examples_panel(
+    stack_path: Optional[str],
+    size=(520, 420),
+    title="Particles",
+    cfg: Optional[dict] = None,
+    title_font_size: int = 11,
+    title_h: int = 20,
+    title_y_pad: int = 2,
+    title_bg=(255, 255, 255),
+    title_text_color=(20, 20, 20),
+    title_font_weight="normal",
+) -> Image.Image:
+    cfg = dict(cfg or {})
+
+    if not stack_path:
+        return make_placeholder(size=size, text="Particles unavailable")
+
+    try:
+        montage = load_particle_stack_montage_matplotlib(
+            stack_path=stack_path,
+            cfg=cfg,
+        )
+
+        if montage is None:
+            return make_placeholder(size=size, text="Particles unavailable")
+
+        return add_plot_style_title_band(
+            montage.convert("RGB"),
+            title,
+            canvas_size=size,
+            font_size=title_font_size,
+            title_h=title_h,
+            y_pad=title_y_pad,
+            bg=title_bg,
+            text_color=title_text_color,
+            font_weight=title_font_weight,
+            dpi=100,
+        )
+
+    except Exception as e:
+        return make_placeholder(size=size, text=f"Particles unavailable\n{e}")
 
 
 def make_classavg_montages(
@@ -1717,7 +1963,38 @@ def make_classavg_montages(
     sort_by_count: bool = True,
     count_key: str = "particle_count",
     force_black_borders: bool = False,
+    style_cfg: Optional[dict] = None,
 ) -> List[Image.Image]:
+    style_cfg = dict(style_cfg or {})
+    _require_cfg_keys(
+        "classavg style_cfg",
+        style_cfg,
+        [
+            "facecolor",
+            "cell_facecolor",
+            "neutral_cell_border_color",
+            "neutral_cell_border_width",
+            "selected_border_color",
+            "selected_border_width",
+            "rejected_border_color",
+            "rejected_border_width",
+            "unknown_border_color",
+            "unknown_border_width",
+            "force_black_border_color",
+            "force_black_border_width",
+            "resolution_fontsize",
+            "count_fontsize",
+            "text_color",
+            "img_extent",
+            "subplot_left",
+            "subplot_right",
+            "subplot_bottom",
+            "subplot_top",
+            "subplot_wspace",
+            "subplot_hspace",
+        ],
+    )
+
     arr = load_mrc(mrc_path)
     arr = normalize_stack(arr)
 
@@ -1734,12 +2011,14 @@ def make_classavg_montages(
     fig_w = (cols * tile_size) / float(dpi)
     fig_h = (rows_per_page * tile_size) / float(dpi)
 
-    img_x0 = 0.10
-    img_x1 = 0.90
-    img_y0 = 0.15
-    img_y1 = 0.95
+    img_x0, img_x1, img_y0, img_y1 = style_cfg["img_extent"]
 
-    neutral_cell_border = (180/255.0, 180/255.0, 180/255.0)
+    white = (255, 255, 255)
+    neutral_cell_border = _rgb_to_mpl(white)
+    selected_border = _rgb_to_mpl(style_cfg["selected_border_color"])
+    rejected_border = _rgb_to_mpl(style_cfg["rejected_border_color"])
+    unknown_border = _rgb_to_mpl(style_cfg["unknown_border_color"])
+    force_black_border = _rgb_to_mpl(style_cfg["force_black_border_color"])
 
     def get_count(info: dict) -> Optional[int]:
         if not info:
@@ -1776,15 +2055,15 @@ def make_classavg_montages(
             dpi=dpi,
             squeeze=False,
         )
-        fig.patch.set_facecolor("white")
+        fig.patch.set_facecolor(style_cfg["facecolor"])
 
         fig.subplots_adjust(
-            left=0.02,
-            right=0.98,
-            bottom=0.02,
-            top=0.98,
-            wspace=0.08,
-            hspace=0.08,
+            left=style_cfg["subplot_left"],
+            right=style_cfg["subplot_right"],
+            bottom=style_cfg["subplot_bottom"],
+            top=style_cfg["subplot_top"],
+            wspace=style_cfg["subplot_wspace"],
+            hspace=style_cfg["subplot_hspace"],
         )
 
         flat_axes = axes.ravel()
@@ -1794,7 +2073,7 @@ def make_classavg_montages(
             ax.set_yticks([])
             ax.set_xlim(0, 1)
             ax.set_ylim(0, 1)
-            ax.set_facecolor("white")
+            ax.set_facecolor(style_cfg["cell_facecolor"])
             for spine in ax.spines.values():
                 spine.set_visible(False)
 
@@ -1804,7 +2083,7 @@ def make_classavg_montages(
                     1.0,
                     1.0,
                     fill=False,
-                    linewidth=1.0,
+                    linewidth=style_cfg["neutral_cell_border_width"],
                     edgecolor=neutral_cell_border,
                     transform=ax.transAxes,
                     zorder=10,
@@ -1822,17 +2101,17 @@ def make_classavg_montages(
             particle_count = get_count(info)
 
             if force_black_borders:
-                cell_border_color = (0.0, 0.0, 0.0)
-                cell_border_width = 1.8
+                cell_border_color = force_black_border
+                cell_border_width = style_cfg["force_black_border_width"]
             elif selected is True:
-                cell_border_color = (30/255.0, 150/255.0, 30/255.0)
-                cell_border_width = 2.0
+                cell_border_color = selected_border
+                cell_border_width = style_cfg["selected_border_width"]
             elif selected is False:
-                cell_border_color = (180/255.0, 60/255.0, 60/255.0)
-                cell_border_width = 2.0
+                cell_border_color = rejected_border
+                cell_border_width = style_cfg["rejected_border_width"]
             else:
-                cell_border_color = (255.0, 255.0, 255.0)
-                cell_border_width = 1.5
+                cell_border_color = unknown_border
+                cell_border_width = style_cfg["unknown_border_width"]
 
             vmin, vmax = get_display_limits(
                 img,
@@ -1891,8 +2170,8 @@ def make_classavg_montages(
                         transform=ax.transAxes,
                         ha="left",
                         va="bottom",
-                        fontsize=8,
-                        color="black",
+                        fontsize=style_cfg["resolution_fontsize"],
+                        color=style_cfg["text_color"],
                         zorder=12,
                     )
                 except Exception:
@@ -1906,8 +2185,8 @@ def make_classavg_montages(
                     transform=ax.transAxes,
                     ha="right",
                     va="bottom",
-                    fontsize=8,
-                    color="black",
+                    fontsize=style_cfg["count_fontsize"],
+                    color=style_cfg["text_color"],
                     zorder=12,
                 )
 
@@ -1916,7 +2195,7 @@ def make_classavg_montages(
             buf,
             format="png",
             dpi=dpi,
-            facecolor="white",
+            facecolor=style_cfg["facecolor"],
             edgecolor="none",
         )
         plt.close(fig)
@@ -1931,6 +2210,7 @@ def make_classavg_montages(
 
 
 def make_micrograph_panel(
+    ws,
     exp: dict,
     title_prefix: str,
     fmt_num,
@@ -1949,153 +2229,86 @@ def make_micrograph_panel(
     style: Optional[dict] = None,
     plot_cfg: Optional[dict] = None,
 ) -> Image.Image:
-    """
-    Build one wide micrograph summary panel.
+    layout_cfg = dict(layout or {})
+    style_cfg = dict(style or {})
+    plot_cfg_full = dict(plot_cfg or {})
 
-    Main layout:
-      left   : large micrograph
-      top    : 2D CTF | Global motion | Local motion | Local Defocus
-      bottom : 1D CTF
-      footer : one-line metadata summary
+    _require_cfg_keys(
+        "layout",
+        layout_cfg,
+        [
+            "panel_w",
+            "panel_h",
+            "margin",
+            "gap",
+            "title_h",
+            "meta_h",
+            "title_meta_gap",
+            "meta_line_gap",
+            "meta_content_gap",
+            "left_col_frac",
+            "particles_h_frac",
+            "ctf1d_h_frac",
+            "min_particles_h",
+            "min_ctf1d_h",
+            "min_micrograph_h",
+            "right_panel_count",
+        ],
+    )
 
-    You can customize appearance by passing optional dictionaries:
-      - layout   : panel sizing / spacing
-      - style    : font sizes / colors / title band sizes
-      - plot_cfg : motion + defocus plot rendering settings
+    _require_cfg_keys(
+        "style",
+        style_cfg,
+        [
+            "title_font_size",
+            "body_font_size",
+            "small_title_font_size",
+            "small_title_band_h",
+            "small_title_y_pad",
+            "title_color",
+            "body_color",
+            "border_color",
+            "bg_color",
+            "band_bg_color",
+            "band_text_color",
+            "band_font_weight",
+            "panel_border_width",
+            "panel_border_color",
+        ],
+    )
 
-    Example:
-        img = make_micrograph_panel(
-            exp,
-            "Accepted",
-            fmt_num,
-            display_mode="percentile",
-            layout={
-                "panel_w": 2300,
-                "panel_h": 820,
-                "left_frac": 0.30,
-                "top_panel_count": 4,
-                "gap": 14,
-            },
-            style={
-                "title_font_size": 22,
-                "body_font_size": 15,
-                "small_title_font_size": 12,
-                "small_title_band_h": 24,
-            },
-            plot_cfg={
-                "local_motion_viewer_scale": 45.0,
-                "defocus_display_grid": 200,
-                "defocus_z_half_range_A": 3000.0,
-            },
-        )
-    """
-    # ------------------------------------------------------------------
-    # 1) EDIT THESE SETTINGS
-    # ------------------------------------------------------------------
-    layout_defaults = {
-        # Overall panel canvas size
-        "panel_w": 2100,
-        "panel_h": 760,
+    _require_cfg_keys(
+        "plot_cfg",
+        plot_cfg_full,
+        [
+            "global_motion",
+            "local_motion",
+            "local_defocus",
+            "ctf_1d",
+            "particles",
+        ],
+    )
 
-        # Outer margins and spacing
-        "margin": 10,
-        "gap": 12,
-
-        # Reserved vertical bands
-        "title_h": 38,
-        "footer_h": 38,
-
-        # Fraction of content width used by the left micrograph pane
-        # Increase this to make the micrograph larger.
-        # Decrease this to make the right-side plots larger.
-        "left_frac": 0.28,
-
-        # Number of square plots on the top-right row
-        "top_panel_count": 4,
-
-        # Safety limits for top/bottom areas
-        "min_bottom_h": 150,
-        "min_top_sq": 260,
-    }
-
-    style_defaults = {
-        # Font sizes
-        "title_font_size": 20,
-        "body_font_size": 18,
-        "small_title_font_size": 14,
-
-        # Small title band above images like "2D CTF"
-        "small_title_band_h": 20,
-        "small_title_y_pad": 2,
-
-        # Colors
-        "title_color": (0, 0, 0),
-        "body_color": (20, 20, 20),
-        "border_color": (185, 185, 185),
-        "bg_color": "white",
-    }
-
-    plot_defaults = {
-        "global_motion": {
-            "title": "Global motion",
-            "line_width": 1.2,
-            "title_fontsize": 8,
-            "tick_labelsize": 6,
-        },
-        "local_motion": {
-            "title": "Local motion",
-            "patch_spacing_A": 380.0,
-            "patch_size_A": 500.0,
-            "viewer_scale": 40.0,
-            "traj_lw": 1.0,
-            "title_fontsize": 8,
-        },
-        "local_defocus": {
-            "title": "Local Defocus",
-            "display_grid": 180,
-            "mode": "nearest",
-            "elev": 28,
-            "azim": -58,
-            "cmap": "viridis",
-            "z_half_range_A": 2500.0,
-            "title_fontsize": 8,
-        },
-        "ctf_1d": {
-            "render_scale": 3,
-            "title_fontsize": 7.5,
-            "legend_fontsize": 6.5,
-            "tick_labelsize": 7,
-        },
-    }
-
-    layout_cfg = dict(layout_defaults)
-    style_cfg = dict(style_defaults)
-    plot_cfg_full = merge_nested_dicts(plot_defaults, plot_cfg)
-
-    if layout:
-        layout_cfg.update(layout)
-    if style:
-        style_cfg.update(style)
-    if plot_cfg:
-        plot_cfg_full.update(plot_cfg)
-
-    # ------------------------------------------------------------------
-    # 2) UNPACK SETTINGS
-    # ------------------------------------------------------------------
     W = int(layout_cfg["panel_w"])
     H = int(layout_cfg["panel_h"])
-
     M = int(layout_cfg["margin"])
     G = int(layout_cfg["gap"])
 
-    title_h = int(layout_cfg["title_h"])
-    footer_h = int(layout_cfg["footer_h"])
+    title_h_min = int(layout_cfg["title_h"])
+    meta_h_min = int(layout_cfg["meta_h"])
+    title_meta_gap = int(layout_cfg["title_meta_gap"])
+    meta_line_gap = int(layout_cfg["meta_line_gap"])
+    meta_content_gap = int(layout_cfg["meta_content_gap"])
 
-    left_frac = float(layout_cfg["left_frac"])
-    top_panel_count = max(1, int(layout_cfg["top_panel_count"]))
+    left_col_frac = float(layout_cfg["left_col_frac"])
+    particles_h_frac = float(layout_cfg["particles_h_frac"])
+    ctf1d_h_frac = float(layout_cfg["ctf1d_h_frac"])
+    min_particles_h = int(layout_cfg["min_particles_h"])
+    min_ctf1d_h = int(layout_cfg["min_ctf1d_h"])
+    min_micrograph_h = int(layout_cfg["min_micrograph_h"])
 
-    min_bottom_h = int(layout_cfg["min_bottom_h"])
-    min_top_sq = int(layout_cfg["min_top_sq"])
+    # In the new layout, right_panel_count should usually be 3
+    right_panel_count = max(1, int(layout_cfg["right_panel_count"]))
 
     title_font = load_font(int(style_cfg["title_font_size"]), bold=True)
     body_font = load_font(int(style_cfg["body_font_size"]), bold=False)
@@ -2108,35 +2321,126 @@ def make_micrograph_panel(
     body_color = style_cfg["body_color"]
     border_color = style_cfg["border_color"]
     bg_color = style_cfg["bg_color"]
+    band_bg_color = style_cfg["band_bg_color"]
+    band_text_color = style_cfg["band_text_color"]
+    band_font_weight = style_cfg["band_font_weight"]
+
+    panel_border_width = int(style_cfg["panel_border_width"])
+    panel_border_color = style_cfg["panel_border_color"]
+
+    def _sf(val, ndigits):
+        if val is None:
+            return "—"
+        try:
+            return fmt_num(val, ndigits)
+        except Exception:
+            try:
+                return f"{float(val):.{ndigits}f}"
+            except Exception:
+                return "—"
 
     # ------------------------------------------------------------------
-    # 3) COMPUTE PANEL GEOMETRY
+    # Header text
+    # ------------------------------------------------------------------
+    viewer_exp_num = exp.get("uid", exp.get("exposure_number", ""))
+    title = (
+        f"Exp #{viewer_exp_num} | "
+        f"CTF {_sf(exp.get('ctf_fit_A'), 2)} Å | "
+        f"Defocus {_sf(exp.get('defocus_um'), 2)} µm"
+    )
+
+    basename = (exp.get("abs_file_path") or "").split("/")[-1]
+    active_picker, active_pick_count = get_active_picker_info(exp)
+    angast = _get_exp_raw_nested(exp or {}, "groups", "exposure", "ctf", "df_angle_rad", default=None)
+    phase = _get_exp_raw_nested(exp or {}, "groups", "exposure", "ctf", "phase_shift_rad", default=None)
+
+    meta_line_1 = f"{basename} | {_sf(lowpass_A, 0)} Å lowpass"
+    meta_line_2 = (
+        f"Total motion: {_sf(exp.get('total_motion_pix'), 2)} px | "
+        f"Max in-frame motion: {_sf(exp.get('max_inframe_motion'), 3)} | "
+        f"Angast {_sf(angast, 3)} | "
+        f"Phase {_sf(phase, 3)}"
+    )
+    meta_line_3 = (
+        f"Picker: {active_picker} | "
+        f"Picks: {active_pick_count} | "
+        f"Extracted: {exp.get('extracted_particles', 0)}"
+    )
+
+    _tmp = Image.new("RGB", (10, 10), bg_color)
+    _draw = ImageDraw.Draw(_tmp)
+
+    title_bbox = _draw.textbbox((0, 0), title, font=title_font)
+    title_text_h = title_bbox[3] - title_bbox[1]
+
+    body_bbox = _draw.textbbox((0, 0), "Ag", font=body_font)
+    body_line_h = body_bbox[3] - body_bbox[1]
+
+    title_block_h = max(title_h_min, title_text_h)
+    meta_block_h = max(meta_h_min, 3 * body_line_h + 2 * meta_line_gap)
+
+    # ------------------------------------------------------------------
+    # Overall content area
     # ------------------------------------------------------------------
     content_x = M
-    content_y = M + title_h
+    content_y = M + title_block_h + title_meta_gap + meta_block_h + meta_content_gap
     content_w = W - 2 * M
-    content_h = H - 2 * M - title_h - footer_h
+    content_h = H - M - content_y
 
-    left_w = int(content_w * left_frac)
+    left_w = int(round(content_w * left_col_frac))
     right_w = content_w - left_w - G
 
-    # Size of each square in the top row
-    top_sq = (right_w - (top_panel_count - 1) * G) // top_panel_count
-    bottom_h = content_h - top_sq - G
+    # Bottom row: full-width 1D CTF
+    ctf1d_h = max(min_ctf1d_h, int(round(content_h * ctf1d_h_frac)))
+    upper_h = content_h - ctf1d_h - G
 
-    # Keep bottom panel from collapsing too much
-    if bottom_h < min_bottom_h:
-        top_sq = max(min_top_sq, top_sq - (min_bottom_h - bottom_h))
-        bottom_h = content_h - top_sq - G
+    # Under-micrograph row in left column:
+    # left half = particles, right half = local defocus
+    under_micro_h = max(min_particles_h, int(round(content_h * particles_h_frac)))
+    micrograph_h = upper_h - under_micro_h - G
+
+    # If the micrograph gets too short, shrink the under-micrograph row first,
+    # then shrink the bottom 1D CTF row if needed.
+    if micrograph_h < min_micrograph_h:
+        deficit = min_micrograph_h - micrograph_h
+
+        shrink_under = min(deficit, max(0, under_micro_h - min_particles_h))
+        under_micro_h -= shrink_under
+        deficit -= shrink_under
+
+        if deficit > 0:
+            shrink_ctf = min(deficit, max(0, ctf1d_h - min_ctf1d_h))
+            ctf1d_h -= shrink_ctf
+            deficit -= shrink_ctf
+
+        if deficit > 0:
+            take_under = min(deficit // 2 + deficit % 2, max(0, under_micro_h - 140))
+            under_micro_h -= take_under
+            deficit -= take_under
+
+        if deficit > 0:
+            take_ctf = min(deficit, max(0, ctf1d_h - 160))
+            ctf1d_h -= take_ctf
+            deficit -= take_ctf
+
+        upper_h = content_h - ctf1d_h - G
+        micrograph_h = upper_h - under_micro_h - G
+
+    # Right column occupies only the upper area, split into 3 panels
+    right_block_h = (upper_h - (right_panel_count - 1) * G) // right_panel_count
+
+    # Under-micrograph row split into 2
+    under_left_w = (left_w - G) // 2
+    under_right_w = left_w - under_left_w - G
 
     # ------------------------------------------------------------------
-    # 4) LOAD / RENDER LEFT MICROGRAPH
+    # Left column: micrograph
     # ------------------------------------------------------------------
     micrograph_path = exp.get("micrograph_path") or exp.get("thumb_path")
     micrograph_psize_A = exp.get("micrograph_psize_A")
 
     if micrograph_path:
-        left = mrc_2d_to_pil(
+        left_micro = mrc_2d_to_pil(
             micrograph_path,
             invert=invert,
             display_mode=display_mode,
@@ -2152,13 +2456,79 @@ def make_micrograph_panel(
             angpix_A=micrograph_psize_A,
             origin="upper",
         )
-        left = fit_within(left, left_w, content_h)
-        left = overlay_blob_picks(left, exp.get("extracted_cs_path") or exp.get("pick_cs_path"))
-    else:
-        left = make_placeholder(size=(left_w, content_h), text="Micrograph unavailable")
+
+        overlay_kwargs = get_pick_overlay_params(ws, exp)
+
+        left_micro = overlay_blob_picks(
+            left_micro,
+            exp.get("pick_cs_path"),
+            **overlay_kwargs,
+        )
+
+        left_micro = fit_within(left_micro, left_w, micrograph_h)
+
+        left_micro = add_plot_style_title_band(
+            left_micro.convert("RGB"),
+            "Micrograph",
+            canvas_size=(left_w, micrograph_h),
+            font_size=small_title_font_size,
+            title_h=small_title_band_h,
+            y_pad=small_title_y_pad,
+            bg=band_bg_color,
+            text_color=band_text_color,
+            font_weight=band_font_weight,
+            dpi=100,
+        )
 
     # ------------------------------------------------------------------
-    # 5) TOP RIGHT: 2D CTF
+    # Under micrograph: particles on left
+    # ------------------------------------------------------------------
+    particles_panel = make_particle_examples_panel(
+        exp.get("particle_stack_path"),
+        size=(under_left_w, under_micro_h),
+        title="Particles",
+        cfg=plot_cfg_full["particles"],
+        title_font_size=small_title_font_size,
+        title_h=small_title_band_h,
+        title_y_pad=small_title_y_pad,
+        title_bg=band_bg_color,
+        title_text_color=band_text_color,
+        title_font_weight=band_font_weight,
+    )
+    particles_panel = fit_within(particles_panel, under_left_w, under_micro_h)
+
+    # ------------------------------------------------------------------
+    # Under micrograph: global motion on right
+    # ------------------------------------------------------------------
+    if exp.get("rigid_motion_path"):
+        global_motion = plot_global_motion_to_pil(
+            exp["rigid_motion_path"],
+            size=(under_right_w, under_micro_h),
+            zero_shift_frame=exp.get("rigid_zero_shift_frame", 0),
+            cfg=plot_cfg_full["global_motion"],
+        )
+        global_motion = fit_within(global_motion, under_right_w, under_micro_h)
+    else:
+        global_motion = make_placeholder(size=(under_right_w, under_micro_h), text="Global motion unavailable")
+        global_motion = fit_within(global_motion, under_right_w, under_micro_h)
+
+    # ------------------------------------------------------------------
+    # Bottom full-width: 1D CTF
+    # ------------------------------------------------------------------
+    if exp.get("ctf_1d_path"):
+        ctf1d = plot_ctf_1d_to_pil(
+            exp["ctf_1d_path"],
+            size=(content_w, ctf1d_h),
+            exp=exp,
+            cfg=plot_cfg_full["ctf_1d"],
+        )
+        ctf1d = fit_within(ctf1d, content_w, ctf1d_h)
+    else:
+        ctf1d = make_placeholder(size=(content_w, ctf1d_h), text="1D CTF unavailable")
+        ctf1d = fit_within(ctf1d, content_w, ctf1d_h)
+
+    # ------------------------------------------------------------------
+    # Right column: 2D CTF
     # ------------------------------------------------------------------
     if exp.get("ctf_diag_path"):
         ctf2d_raw = mrc_2d_to_pil(
@@ -2179,34 +2549,52 @@ def make_micrograph_panel(
         ctf2d = add_plot_style_title_band(
             ctf2d_raw,
             "2D CTF",
-            canvas_size=(top_sq, top_sq),
+            canvas_size=(right_w, right_block_h),
             font_size=small_title_font_size,
             title_h=small_title_band_h,
             y_pad=small_title_y_pad,
+            bg=band_bg_color,
+            text_color=band_text_color,
+            font_weight=band_font_weight,
+            dpi=100,
         )
+        ctf2d = fit_within(ctf2d, right_w, right_block_h)
     else:
-        ctf2d = make_placeholder(size=(top_sq, top_sq), text="2D CTF unavailable")
+        ctf2d = make_placeholder(size=(right_w, right_block_h), text="2D CTF unavailable")
+        ctf2d = fit_within(ctf2d, right_w, right_block_h)
 
     # ------------------------------------------------------------------
-    # 6) TOP RIGHT: GLOBAL MOTION
+    # Right column: Local Defocus
     # ------------------------------------------------------------------
-    if exp.get("rigid_motion_path"):
-        global_motion = plot_global_motion_to_pil(
-            exp["rigid_motion_path"],
-            size=(top_sq, top_sq),
-            zero_shift_frame=exp.get("rigid_zero_shift_frame", 0),
-            cfg=plot_cfg_full["global_motion"],
+    micrograph_shape = _infer_micrograph_shape_from_exp(exp)
+
+    if exp.get("ctf_spline_path"):
+        local_defocus = plot_ctf_defocus_landscape_to_pil(
+            exp["ctf_spline_path"],
+            size=(right_w, right_block_h),
+            micrograph_shape=micrograph_shape,
+            cfg=plot_cfg_full["local_defocus"],
         )
-        global_motion = fit_within(global_motion, top_sq, top_sq)
+        local_defocus = fit_within(local_defocus, right_w, right_block_h)
     else:
-        global_motion = make_placeholder(size=(top_sq, top_sq), text="Global motion unavailable")
+        local_defocus = make_placeholder(size=(right_w, right_block_h), text="Local defocus unavailable")
+        local_defocus = fit_within(local_defocus, right_w, right_block_h)
+
 
     # ------------------------------------------------------------------
-    # 7) TOP RIGHT: LOCAL MOTION
+    # Right column: Local motion
     # ------------------------------------------------------------------
     if exp.get("spline_motion_path"):
-        movie_shape = _get_exp_raw_nested(exp, "groups", "exposure", "movie_blob", "shape", default=None)
-        movie_psize_A = _get_exp_raw_nested(exp, "groups", "exposure", "movie_blob", "psize_A", default=None)
+        movie_shape = _get_exp_raw_nested(
+            exp,
+            "groups", "exposure", "movie_blob", "shape",
+            default=None,
+        )
+        movie_psize_A = _get_exp_raw_nested(
+            exp,
+            "groups", "exposure", "movie_blob", "psize_A",
+            default=None,
+        )
 
         if isinstance(movie_shape, (list, tuple, np.ndarray)) and len(movie_shape) == 3:
             movie_shape = tuple(int(v) for v in movie_shape)
@@ -2218,161 +2606,108 @@ def make_micrograph_panel(
         except Exception:
             movie_psize_A = exp.get("micrograph_psize_A")
 
-        motion = plot_local_motion_to_pil(
+        local_motion = plot_local_motion_to_pil(
             exp["spline_motion_path"],
-            size=(top_sq, top_sq),
+            size=(right_w, right_block_h),
             movie_shape=movie_shape,
             angpix_A=movie_psize_A,
             rigid_motion_path=exp.get("rigid_motion_path"),
             cfg=plot_cfg_full["local_motion"],
         )
-        motion = fit_within(motion, top_sq, top_sq)
+        local_motion = fit_within(local_motion, right_w, right_block_h)
     else:
-        motion = make_placeholder(size=(top_sq, top_sq), text="Local motion unavailable")
+        local_motion = make_placeholder(size=(right_w, right_block_h), text="Local motion unavailable")
+        local_motion = fit_within(local_motion, right_w, right_block_h)
 
     # ------------------------------------------------------------------
-    # 8) TOP RIGHT: LOCAL DEFOCUS
-    # ------------------------------------------------------------------
-    micrograph_shape = _infer_micrograph_shape_from_exp(exp)
-
-    if exp.get("ctf_spline_path"):
-        local_defocus = plot_ctf_defocus_landscape_to_pil(
-            exp["ctf_spline_path"],
-            size=(top_sq, top_sq),
-            micrograph_shape=micrograph_shape,
-            cfg=plot_cfg_full["local_defocus"],
-        )
-        local_defocus = fit_within(local_defocus, top_sq, top_sq)
-    else:
-        local_defocus = make_placeholder(size=(top_sq, top_sq), text="Local defocus unavailable")
-
-    # ------------------------------------------------------------------
-    # 9) BOTTOM RIGHT: 1D CTF
-    # ------------------------------------------------------------------
-    if exp.get("ctf_1d_path"):
-        ctf1d = plot_ctf_1d_to_pil(
-            exp["ctf_1d_path"],
-            size=(right_w, bottom_h),
-            exp=exp,
-            cfg=plot_cfg_full["ctf_1d"],
-        )
-        ctf1d = fit_within(ctf1d, right_w, bottom_h)
-    else:
-        ctf1d = make_placeholder(size=(right_w, bottom_h), text="1D CTF unavailable")
-
-    # ------------------------------------------------------------------
-    # 10) CREATE CANVAS
+    # Canvas
     # ------------------------------------------------------------------
     img = Image.new("RGB", (W, H), bg_color)
     d = ImageDraw.Draw(img)
 
-    viewer_exp_num = exp.get("uid", exp.get("exposure_number", ""))
-    title = (
-        f"{title_prefix} | Exp #{viewer_exp_num} | "
-        f"CTF {fmt_num(exp.get('ctf_fit_A'), 2)} Å | "
-        f"Defocus {fmt_num(exp.get('defocus_um'), 2)} µm"
-    )
     d.text((M, M), title, fill=title_color, font=title_font)
 
-    # ------------------------------------------------------------------
-    # 11) POSITION PANELS
-    # ------------------------------------------------------------------
-    rx = content_x + left_w + G
-    top_y = content_y
-    bottom_y = content_y + top_sq + G
-
-    # Left micrograph centered in left region
-    lx = content_x + (left_w - left.width) // 2
-    ly = content_y + (content_h - left.height) // 2
-
-    # Top row centered in right region
-    top_row_w = top_panel_count * top_sq + (top_panel_count - 1) * G
-    top_row_x = rx + (right_w - top_row_w) // 2
-
-    panel_xs = [top_row_x + i * (top_sq + G) for i in range(top_panel_count)]
-
-    ctf2d_box_x = panel_xs[0] if top_panel_count > 0 else top_row_x
-    global_box_x = panel_xs[1] if top_panel_count > 1 else top_row_x
-    local_box_x = panel_xs[2] if top_panel_count > 2 else top_row_x
-    defocus_box_x = panel_xs[3] if top_panel_count > 3 else top_row_x
-
-    ctf2d_x = ctf2d_box_x + (top_sq - ctf2d.width) // 2
-    ctf2d_y = top_y + (top_sq - ctf2d.height) // 2
-
-    global_x = global_box_x + (top_sq - global_motion.width) // 2
-    global_y = top_y + (top_sq - global_motion.height) // 2
-
-    local_x = local_box_x + (top_sq - motion.width) // 2
-    local_y = top_y + (top_sq - motion.height) // 2
-
-    defocus_x = defocus_box_x + (top_sq - local_defocus.width) // 2
-    defocus_y = top_y + (top_sq - local_defocus.height) // 2
-
-    ctf1d_x = rx + (right_w - ctf1d.width) // 2
-    ctf1d_y = bottom_y + (bottom_h - ctf1d.height) // 2
+    meta_y = M + title_block_h + title_meta_gap
+    d.multiline_text(
+        (M, meta_y),
+        f"{meta_line_1}\n{meta_line_2}\n{meta_line_3}",
+        fill=body_color,
+        font=body_font,
+        spacing=meta_line_gap,
+    )
 
     # ------------------------------------------------------------------
-    # 12) PASTE PANELS
+    # Slots
     # ------------------------------------------------------------------
-    img.paste(left, (lx, ly))
+    left_x = content_x
+    right_x = content_x + left_w + G
+
+    # Upper-left
+    micro_slot = (left_x, content_y, left_w, micrograph_h)
+
+    # Under-micrograph split row
+    under_y = content_y + micrograph_h + G
+    particles_slot = (left_x, under_y, under_left_w, under_micro_h)
+    global_slot = (left_x + under_left_w + G, under_y, under_right_w, under_micro_h)
+
+    # Right column, upper area only
+    r0y = content_y
+    r1y = r0y + right_block_h + G
+    r2y = r1y + right_block_h + G
+
+    ctf2d_slot = (right_x, r0y, right_w, right_block_h)
+    local_defocus_slot = (right_x, r1y, right_w, right_block_h)
+    local_motion_slot = (right_x, r2y, right_w, right_block_h)
+
+    # Bottom full-width
+    ctf1d_y = content_y + upper_h + G
+    ctf1d_slot = (content_x, ctf1d_y, content_w, ctf1d_h)
+
+    def _center_in_slot(im, slot):
+        sx, sy, sw, sh = slot
+        return sx + (sw - im.width) // 2, sy + (sh - im.height) // 2
+
+    micro_x, micro_y = _center_in_slot(left_micro, micro_slot)
+    particles_x, particles_y = _center_in_slot(particles_panel, particles_slot)
+    defocus_x, defocus_y = _center_in_slot(local_defocus, local_defocus_slot)
+
+    ctf2d_x, ctf2d_y = _center_in_slot(ctf2d, ctf2d_slot)
+    global_x, global_y = _center_in_slot(global_motion, global_slot)
+    local_x, local_y = _center_in_slot(local_motion, local_motion_slot)
+
+    ctf1d_x, ctf1d_y = _center_in_slot(ctf1d, ctf1d_slot)
+
+    # ------------------------------------------------------------------
+    # Paste
+    # ------------------------------------------------------------------
+    img.paste(left_micro, (micro_x, micro_y))
+    img.paste(particles_panel, (particles_x, particles_y))
+    img.paste(local_defocus, (defocus_x, defocus_y))
+
     img.paste(ctf2d, (ctf2d_x, ctf2d_y))
     img.paste(global_motion, (global_x, global_y))
-    img.paste(motion, (local_x, local_y))
-    img.paste(local_defocus, (defocus_x, defocus_y))
+    img.paste(local_motion, (local_x, local_y))
+
     img.paste(ctf1d, (ctf1d_x, ctf1d_y))
 
     # ------------------------------------------------------------------
-    # 13) DRAW BORDER BOXES
+    # Optional borders
     # ------------------------------------------------------------------
-    d.rectangle(
-        (content_x, content_y, content_x + left_w, content_y + content_h),
-        outline=border_color,
-        width=1,
-    )
-    d.rectangle(
-        (ctf2d_box_x, top_y, ctf2d_box_x + top_sq, top_y + top_sq),
-        outline=border_color,
-        width=1,
-    )
-    d.rectangle(
-        (global_box_x, top_y, global_box_x + top_sq, top_y + top_sq),
-        outline=border_color,
-        width=1,
-    )
-    d.rectangle(
-        (local_box_x, top_y, local_box_x + top_sq, top_y + top_sq),
-        outline=border_color,
-        width=1,
-    )
-    d.rectangle(
-        (defocus_box_x, top_y, defocus_box_x + top_sq, top_y + top_sq),
-        outline=border_color,
-        width=1,
-    )
-    d.rectangle(
-        (rx, bottom_y, rx + right_w, bottom_y + bottom_h),
-        outline=border_color,
-        width=1,
-    )
-
-    # ------------------------------------------------------------------
-    # 14) FOOTER
-    # ------------------------------------------------------------------
-    basename = (exp.get("abs_file_path") or "").split("/")[-1]
-    active_picker, active_pick_count = get_active_picker_info(exp)
-
-    footer = (
-        f"{basename} | {fmt_num(lowpass_A, 0)} Å lowpass | "
-        f"Status: {exp.get('status','')} | "
-        f"Picker: {active_picker} | "
-        f"Picks: {active_pick_count} | "
-        f"Extracted: {exp.get('extracted_particles', 0)} | "
-        f"Max in-frame motion: {fmt_num(exp.get('max_inframe_motion'), 3)} | "
-        f"Total motion: {fmt_num(exp.get('total_motion_pix'), 2)} px"
-    )
-    d.text((M, H - footer_h + 8), footer, fill=body_color, font=body_font)
+    if panel_border_width > 0:
+        for sx, sy, sw, sh in [
+            micro_slot,
+            particles_slot,
+            local_defocus_slot,
+            ctf2d_slot,
+            global_slot,
+            local_motion_slot,
+            ctf1d_slot,
+        ]:
+            d.rectangle(
+                (sx, sy, sx + sw, sy + sh),
+                outline=panel_border_color,
+                width=panel_border_width,
+            )
 
     return img
-
-
 
