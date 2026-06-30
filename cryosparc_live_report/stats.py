@@ -765,14 +765,14 @@ def build_summary_sections(
         f'&nbsp;&nbsp;&nbsp;'
 #        f'<font color="#2b8cbe"><b>Size:</b> {stats.get("nx", "")} × {stats.get("ny", "")}</font>'
 #        f'&nbsp;&nbsp;&nbsp;'
-        f'<font color="#31a354"><b>Pixel:</b> {fmt_num(params.get("psize_A"), 3)} Å/pix</font>'
+        f'<font color="#31a354"><b>Pixel Size:</b> {fmt_num(params.get("psize_A"), 3)} Å/px</font>'
         f'&nbsp;&nbsp;&nbsp;'
-        f'<font color="#756bb1"><b>Dose:</b> {fmt_num(params.get("total_dose_e_per_A2"), 1)} e/A2</font>'
+        f'<font color="#756bb1"><b>Dose:</b> {fmt_num(params.get("total_dose_e_per_A2"), 1)} e-/Å²</font>'
     )
 
     imaging_rows = [
 #        ("Frames per Movie", str(stats.get("frames", ""))),
-        ("Image Dimensions (pixels)", f"{stats.get('nx', '')} × {stats.get('ny', '')}"),
+        ("Image Dimensions (px)", f"{stats.get('nx', '')} × {stats.get('ny', '')}"),
 #        ("Pixel Size (A/pix)", fmt_num(params.get("psize_A"), 3)),
         ("Acceleration Voltage (kV)", fmt_num(params.get("accel_kv"), 1)),
         ("Spherical Aberration (mm)", fmt_num(params.get("cs_mm"), 2)),
@@ -800,12 +800,14 @@ def build_summary_sections(
         if current_picker == "deep" else ""
     )
 
+    box_size_A = fmt_num((params.get("box_size_pix")) * (params.get("psize_A")), 0)
+
     picking_summary_html = (
         f'<font color="#3182bd"><b>Picker:</b> {current_picker}</font>'
         f'&nbsp;&nbsp;&nbsp;'
-        f'<font color="#2ca25f"><b>Box Size:</b> {params.get("box_size_pix")} pix</font>'
+        f'<font color="#2ca25f"><b>Box Size:</b> {params.get("box_size_pix")} px | {box_size_A} Å</font>'
         f'&nbsp;&nbsp;&nbsp;'
-        f'<font color="#2ca25f"><b>Fourier Crop Box Size:</b> {params.get("bin_size_pix")} pix</font>'
+        f'<font color="#2ca25f"><b>Fourier Crop Box Size:</b> {params.get("bin_size_pix")} px</font>'
         f'&nbsp;&nbsp;&nbsp;'
         f'<font color="#756bb1"><b>Extracted:</b> {stats.get("total_extracted_particles", "")}</font>'
         f'&nbsp;&nbsp;&nbsp;'

@@ -19,6 +19,8 @@ from matplotlib.collections import PolyCollection
 from scipy.ndimage import gaussian_filter, gaussian_filter1d
 from scipy.spatial.transform import Rotation
 
+from PIL import Image, ImageDraw, ImageFont
+
 try:
     from skimage.measure import marching_cubes
     HAVE_SKIMAGE = True
@@ -29,6 +31,11 @@ try:
     from cryosparc_live_report.textstyle import build_refinement_text_settings
 except Exception:
     print("no textstyle subscript")
+
+try:
+    from cryosparc_live_report.scale_bars import choose_scale_bar_for_display
+except Exception:
+    choose_scale_bar_for_display = None
 
 REFINE_TEXT = build_refinement_text_settings()
 
@@ -293,6 +300,65 @@ def add_panel_labels(fig, axes, labels, dy=0.01, fontsize=None):
         bb = ax.get_position()
         xc = 0.5 * (bb.x0 + bb.x1)
         fig.text(xc, bb.y1 + dy, lab, ha="center", va="bottom", fontsize=fontsize)
+        
+def render_text_crop(text, font, fg=(0, 0, 0), bg=(255, 255, 255), pad=12, out_pad=3):
+    """
+    Render text to a temporary image, crop to visible bounds, then add a small
+    white safety border so pasted text is never visibly clipped.
+    """
+    if not text:
+        return Image.new("RGB", (1, 1), bg)
+
+
+    W = max(128, int(8 * len(text) * max(8, getattr(font, "size", 12))))
+    H = max(64, int(5 * max(8, getattr(font, "size", 12))))
+    tmp = Image.new("RGB", (W, H), bg)
+    d = ImageDraw.Draw(tmp)
+    d.text((pad, pad), text, fill=fg, font=font)
+
+
+    arr = np.asarray(tmp)
+    bg_arr = np.array(bg, dtype=arr.dtype)
+    mask = np.any(arr != bg_arr, axis=2)
+
+
+    if not np.any(mask):
+        return Image.new("RGB", (1, 1), bg)
+
+
+    ys, xs = np.where(mask)
+    x0 = max(0, int(xs.min()) - out_pad)
+    x1 = min(W, int(xs.max()) + 1 + out_pad)
+    y0 = max(0, int(ys.min()) - out_pad)
+    y1 = min(H, int(ys.max()) + 1 + out_pad)
+
+
+    return tmp.crop((x0, y0, x1, y1))
+    
+def load_pil_font(size=16, bold=False):
+    candidates = []
+    if bold:
+        candidates += [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+        ]
+    else:
+        candidates += [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+        ]
+
+
+    for p in candidates:
+        try:
+            return ImageFont.truetype(p, size=size)
+        except Exception:
+            pass
+
+
+    return ImageFont.load_default()
 
 # ============================================================
 # slice extraction
@@ -877,6 +943,7 @@ def save_surface_views(
     dpi=200,
     embed_header=True,
     embed_plane_labels=True,
+    scale_bar_length_A=None,
 ):
     """
     Save three principal orthographic surface projections (YZ, XZ, XY)
@@ -1071,6 +1138,105 @@ def save_surface_views(
     for i, (lab, img) in enumerate(rendered_panels):
         x0_px = left_px + i * (panel_px + gap_px)
 
+        if i == 0:
+            try:
+                pil_img = Image.fromarray(img).convert("RGB")
+
+
+                # Same styling philosophy that worked for the micrograph/particles
+                scale_font_size = 36
+                scale_thickness = 12
+                scale_top_margin = 0
+                scale_gap = 6
+                scale_bottom_margin = 3
+
+
+                plot_lim = max(float(lim), 1e-6) * 1.01
+                base_display_angpix_A = (2.0 * plot_lim) / float(panel_px)
+
+
+                chosen_bar_A, label_text, _ = choose_scale_bar_for_display(
+                    display_size_px=panel_px,
+                    display_angpix_A=base_display_angpix_A,
+                    bar_length_A=None,
+                    target_frac=0.22,
+                    max_frac=0.33,
+                    label_unit="A",
+                )
+
+
+                if chosen_bar_A is not None and label_text:
+                    scale_font = load_pil_font(scale_font_size, bold=False)
+                    label_img = render_text_crop(
+                        label_text,
+                        scale_font,
+                        fg=(0, 0, 0),
+                        bg=(255, 255, 255),
+                        pad=12,
+                        out_pad=3,
+                    )
+                    label_w, label_h = label_img.size
+
+
+                    scale_strip_h = (
+                        scale_top_margin
+                        + scale_thickness
+                        + scale_gap
+                        + label_h
+                        + scale_bottom_margin
+                        + 2
+                    )
+
+
+                    image_h_budget = max(20, panel_px - scale_strip_h)
+
+
+                    # Fit the square rendered panel into the reduced image area
+                    fitted_surface = pil_img.copy()
+                    fitted_surface.thumbnail((panel_px, image_h_budget), Image.Resampling.LANCZOS)
+
+
+                    composed = Image.new("RGB", (panel_px, panel_px), (255, 255, 255))
+                    d_comp = ImageDraw.Draw(composed)
+
+
+                    img_x = (panel_px - fitted_surface.width) // 2
+                    img_y = (image_h_budget - fitted_surface.height) // 2
+                    composed.paste(fitted_surface, (img_x, img_y))
+
+
+                    # Recompute displayed Å/px after fitting
+                    display_angpix_A = (2.0 * plot_lim) / float(fitted_surface.width)
+                    bar_px = int(round(float(chosen_bar_A) / float(display_angpix_A)))
+
+
+                    strip_y0 = image_h_budget
+                    side_margin_px = 16
+                    x_left = img_x + side_margin_px
+                    x_right = x_left + bar_px - 1
+
+
+                    y_bar_top = strip_y0 + scale_top_margin
+                    y_bar_bottom = y_bar_top + scale_thickness - 1
+                    y_text = y_bar_bottom + 1 + scale_gap
+
+
+                    x_text = x_left + (bar_px - label_w) // 2
+                    x_text = max(0, min(panel_px - label_w, x_text))
+                    y_text = max(strip_y0, min(panel_px - label_h, y_text))
+
+
+                    d_comp.rectangle(
+                        [x_left, y_bar_top, x_right, y_bar_bottom],
+                        fill=(0, 0, 0),
+                    )
+                    composed.paste(label_img, (x_text, y_text))
+
+
+                    img = np.asarray(composed)
+            except Exception:
+                pass
+
 
         ax = fig.add_axes(
             [
@@ -1085,7 +1251,6 @@ def save_surface_views(
 
         ax.imshow(img, interpolation="nearest")
         ax.set_axis_off()
-
 
         if embed_plane_labels:
             ax.text(
@@ -2261,6 +2426,7 @@ def generate_initial_model_pngs(
     threshold_value=None,
     text_theme=None,
     embed_titles=True,
+    scale_bar_length_A=None,
 ):
     """
     Generate only surface-view PNGs for ab-initio / initial-model classes.
@@ -2311,6 +2477,7 @@ def generate_initial_model_pngs(
             dpi=400,
             embed_header=embed_titles,
             embed_plane_labels=True,
+            scale_bar_length_A=None,
         )
 
         outputs.append({
@@ -2333,6 +2500,7 @@ def generate_report_pngs(
     slice_vmax=None,
     text_theme=None,
     embed_titles=True,
+    scale_bar_length_A=None,
 ):
     set_refinement_text_theme(text_theme)
 
@@ -2425,6 +2593,7 @@ def generate_report_pngs(
         dpi=400,
         embed_header=embed_titles,
         embed_plane_labels=True,
+        scale_bar_length_A=None,
     )
 
     # view lookup chart

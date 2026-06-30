@@ -35,6 +35,18 @@ try:
 except Exception:
     RESAMPLE = Image.LANCZOS
 
+try:
+    from .scale_bars import (
+        add_bottom_scale_bar_pil,
+        add_inset_scale_bar_pil,
+        choose_scale_bar_for_display,
+        format_length,
+    )
+except Exception:
+    add_bottom_scale_bar_pil = None
+    add_inset_scale_bar_pil = None
+    choose_scale_bar_for_display = None
+    format_length=None
 
 A_TO_UM = 1e-4  # 1 Å = 1e-4 µm
 
@@ -73,6 +85,39 @@ def make_placeholder(size=(800, 800), text="Image not available") -> Image.Image
     d.text((20, 20), text, fill=(30, 30, 30), font=load_font(20))
     return img
 
+def render_text_crop(text, font, fg=(0, 0, 0), bg=(255, 255, 255), pad=12, out_pad=3) -> Image.Image:
+    """
+    Render text to a temporary image, crop to visible bounds, then add a small
+    white safety border so pasted text is never visibly clipped.
+    """
+    if not text:
+        return Image.new("RGB", (1, 1), bg)
+
+
+    W = max(128, int(8 * len(text) * max(8, getattr(font, "size", 12))))
+    H = max(64, int(5 * max(8, getattr(font, "size", 12))))
+    tmp = Image.new("RGB", (W, H), bg)
+    d = ImageDraw.Draw(tmp)
+    d.text((pad, pad), text, fill=fg, font=font)
+
+
+    arr = np.asarray(tmp)
+    bg_arr = np.array(bg, dtype=arr.dtype)
+    mask = np.any(arr != bg_arr, axis=2)
+
+
+    if not np.any(mask):
+        return Image.new("RGB", (1, 1), bg)
+
+
+    ys, xs = np.where(mask)
+    x0 = max(0, int(xs.min()) - out_pad)
+    x1 = min(W, int(xs.max()) + 1 + out_pad)
+    y0 = max(0, int(ys.min()) - out_pad)
+    y1 = min(H, int(ys.max()) + 1 + out_pad)
+
+
+    return tmp.crop((x0, y0, x1, y1))
 
 def mplfig_to_pil(fig) -> Image.Image:
     buf = io.BytesIO()
@@ -733,6 +778,34 @@ def get_pick_overlay_params(ws: dict, exp: dict) -> dict:
         "power_min": power_min,
         "power_max": power_max,
     }
+
+def _pick_diameter_A_from_overlay_params(p: dict):
+    if not isinstance(p, dict):
+        return None
+
+
+    picker = str(p.get("picker_type") or "").strip().lower()
+
+
+    candidates = []
+    if picker == "blob":
+        candidates = [p.get("blob_diameter_max_A"), p.get("template_diameter_A")]
+    elif picker == "template":
+        candidates = [p.get("template_diameter_A"), p.get("blob_diameter_max_A")]
+    else:
+        candidates = [p.get("template_diameter_A"), p.get("blob_diameter_max_A")]
+
+
+    for v in candidates:
+        try:
+            x = float(v)
+            if np.isfinite(x) and x > 0:
+                return x
+        except Exception:
+            pass
+
+
+    return None
 
 def overlay_blob_picks(
     base_img: Image.Image,
@@ -1699,6 +1772,7 @@ def load_particle_stack_montage_matplotlib(
     try:
         arr = load_mrc(stack_path)
         arr = normalize_stack(arr)
+        particle_angpix_A = get_mrc_voxel_size_A(stack_path)
 
         if arr.ndim != 3 or arr.shape[0] == 0:
             return None
@@ -1914,30 +1988,183 @@ def make_particle_examples_panel(
 ) -> Image.Image:
     cfg = dict(cfg or {})
 
+
     if not stack_path:
         return make_placeholder(size=size, text="Particles unavailable")
+
 
     try:
         montage = load_particle_stack_montage_matplotlib(
             stack_path=stack_path,
             cfg=cfg,
         )
-
         if montage is None:
             return make_placeholder(size=size, text="Particles unavailable")
 
-        return add_plot_style_title_band(
-            montage.convert("RGB"),
-            title,
-            canvas_size=size,
-            font_size=title_font_size,
-            title_h=title_h,
-            y_pad=title_y_pad,
-            bg=title_bg,
-            text_color=title_text_color,
-            font_weight=title_font_weight,
-            dpi=100,
+
+        panel_w = int(size[0])
+        panel_h = int(size[1])
+        title_band_h = int(title_h)
+        content_h = panel_h - title_band_h
+
+
+        particle_angpix_A = get_mrc_voxel_size_A(stack_path)
+        scale_bar_length_A = cfg.get("scale_bar_length_A", None)
+
+
+        chosen_bar_A = None
+        label_text = None
+        tile_src_w_px = None
+
+
+        try:
+            angpix = float(particle_angpix_A) if particle_angpix_A is not None else None
+        except Exception:
+            angpix = None
+
+
+        try:
+            arr = load_mrc(stack_path)
+            arr = normalize_stack(arr)
+            if arr.ndim == 3 and arr.shape[0] > 0:
+                tile_src_w_px = int(arr[0].shape[1])
+        except Exception:
+            tile_src_w_px = None
+
+
+        if (
+            choose_scale_bar_for_display is not None
+            and angpix is not None
+            and np.isfinite(angpix)
+            and angpix > 0
+            and tile_src_w_px is not None
+            and tile_src_w_px > 0
+        ):
+            # Since particle bar should match the pick-circle diameter, use the provided fixed length
+            chosen_bar_A, label_text, _ = choose_scale_bar_for_display(
+                display_size_px=tile_src_w_px,
+                display_angpix_A=angpix,
+                bar_length_A=scale_bar_length_A,
+                target_frac=0.22,
+                max_frac=0.33,
+                label_unit="A",
+            )
+
+
+        # Use the same parameters that worked for the micrograph
+        scale_font_size = 18
+        scale_thickness = 6
+        scale_top_margin = 0
+        scale_gap = 6
+        scale_bottom_margin = 3
+
+
+        scale_font = load_font(scale_font_size, bold=False)
+
+
+        if label_text:
+            label_img = render_text_crop(
+                label_text,
+                scale_font,
+                fg=(0, 0, 0),
+                bg=(255, 255, 255),
+                pad=12,
+                out_pad=3,
+            )
+            label_w, label_h = label_img.size
+            scale_strip_h = scale_top_margin + scale_thickness + scale_gap + label_h + scale_bottom_margin + 2
+        else:
+            label_img = None
+            label_w = label_h = 0
+            scale_strip_h = 0
+
+
+        montage_h_budget = max(20, content_h - scale_strip_h)
+        fitted_montage = fit_within(montage, panel_w, montage_h_budget)
+
+
+        panel = Image.new("RGB", (panel_w, panel_h), (255, 255, 255))
+        d = ImageDraw.Draw(panel)
+
+
+        # Title band
+        d.rectangle([0, 0, panel_w, title_band_h], fill=title_bg)
+
+
+        title_font_obj = load_font(
+            title_font_size,
+            bold=(str(title_font_weight).lower() == "bold"),
         )
+        try:
+            tb = d.textbbox((0, 0), title, font=title_font_obj)
+            tw = tb[2] - tb[0]
+            th = tb[3] - tb[1]
+        except Exception:
+            tw, th = d.textsize(title, font=title_font_obj)
+
+
+        tx = (panel_w - tw) // 2
+        ty = (title_band_h - th) // 2 - int(title_y_pad)
+        d.text((tx, ty), title, fill=title_text_color, font=title_font_obj)
+
+
+        # Paste montage into image area
+        image_y0 = title_band_h
+        strip_y0 = title_band_h + montage_h_budget
+
+
+        mx = (panel_w - fitted_montage.width) // 2
+        my = image_y0 + (montage_h_budget - fitted_montage.height) // 2
+        panel.paste(fitted_montage.convert("RGB"), (mx, my))
+
+
+        # Draw bottom-left scale bar beneath montage
+        if (
+            chosen_bar_A is not None
+            and label_img is not None
+            and angpix is not None
+            and fitted_montage.width > 0
+            and tile_src_w_px is not None
+            and tile_src_w_px > 0
+        ):
+            cols = max(1, int(cfg.get("cols", 3)))
+            wspace = float(cfg.get("wspace", 0.1))
+            subplot_left = 0.02
+            subplot_right = 0.98
+            usable_frac = subplot_right - subplot_left
+            tile_w_frac = usable_frac / (cols + (cols - 1.0) * wspace)
+
+
+            tile_display_w_px = float(fitted_montage.width) * tile_w_frac
+            if tile_display_w_px > 1:
+                display_angpix_A = float(angpix) * float(tile_src_w_px) / float(tile_display_w_px)
+                bar_px = int(round(float(chosen_bar_A) / float(display_angpix_A)))
+
+
+                side_margin_px = 14
+                x_left = mx + side_margin_px
+                x_right = x_left + bar_px - 1
+
+
+                y_bar_top = strip_y0 + scale_top_margin
+                y_bar_bottom = y_bar_top + scale_thickness - 1
+                y_text = y_bar_bottom + 1 + scale_gap
+
+
+                x_text = x_left + (bar_px - label_w) // 2
+                x_text = max(0, min(panel_w - label_w, x_text))
+                y_text = max(strip_y0, min(panel_h - label_h, y_text))
+
+
+                d.rectangle(
+                    [x_left, y_bar_top, x_right, y_bar_bottom],
+                    fill=(0, 0, 0),
+                )
+                panel.paste(label_img, (x_text, y_text))
+
+
+        return panel
+
 
     except Exception as e:
         return make_placeholder(size=size, text=f"Particles unavailable\n{e}")
@@ -1965,6 +2192,7 @@ def make_classavg_montages(
     count_key: str = "particle_count",
     force_black_borders: bool = False,
     style_cfg: Optional[dict] = None,
+    scale_bar_length_A: Optional[float] = None,
 ) -> List[Image.Image]:
     style_cfg = dict(style_cfg or {})
     _require_cfg_keys(
@@ -1998,6 +2226,7 @@ def make_classavg_montages(
 
     arr = load_mrc(mrc_path)
     arr = normalize_stack(arr)
+    classavg_angpix_A = get_mrc_voxel_size_A(mrc_path)
 
     if arr.ndim == 2:
         arr = arr[np.newaxis, :, :]
@@ -2205,6 +2434,124 @@ def make_classavg_montages(
         page = Image.open(buf).convert("RGB")
         page.load()
         buf.close()
+        
+        # ------------------------------------------------------------
+        # Add vertical scale bar to the top-left class-average tile
+        # after the page is rendered, so it cannot be clipped by axes.
+        # ------------------------------------------------------------
+        if (
+            page_indices
+            and choose_scale_bar_for_display is not None
+            and format_length is not None
+            and classavg_angpix_A is not None
+        ):
+            try:
+                angpix = float(classavg_angpix_A)
+            except Exception:
+                angpix = None
+
+
+            if angpix is not None and np.isfinite(angpix) and angpix > 0:
+                try:
+                    src_img = np.asarray(arr[page_indices[0]], dtype=np.float32)
+                    src_h_px = int(src_img.shape[0])
+                except Exception:
+                    src_h_px = None
+
+
+                if src_h_px is not None and src_h_px > 0:
+                    page_w, page_h = page.size
+
+
+                    left = float(style_cfg["subplot_left"])
+                    right = float(style_cfg["subplot_right"])
+                    bottom = float(style_cfg["subplot_bottom"])
+                    top = float(style_cfg["subplot_top"])
+                    wspace = float(style_cfg["subplot_wspace"])
+                    hspace = float(style_cfg["subplot_hspace"])
+
+
+                    cell_w_frac = (right - left) / (cols + (cols - 1.0) * wspace)
+                    cell_h_frac = (top - bottom) / (rows_per_page + (rows_per_page - 1.0) * hspace)
+
+
+                    # top-left cell bounds in page pixel coordinates
+                    cell_x0 = int(round(page_w * left))
+                    cell_y0 = int(round(page_h * (1.0 - top)))
+                    cell_w_px = int(round(page_w * cell_w_frac))
+                    cell_h_px = int(round(page_h * cell_h_frac))
+
+
+                    img_x0_frac, img_x1_frac, img_y0_frac, img_y1_frac = style_cfg["img_extent"]
+
+
+                    disp_img_h_px = float(cell_h_px) * float(img_y1_frac - img_y0_frac)
+                    display_angpix_A = float(angpix) * float(src_h_px) / float(disp_img_h_px)
+
+
+                    chosen_bar_A, label_text, _ = choose_scale_bar_for_display(
+                        display_size_px=int(round(disp_img_h_px)),
+                        display_angpix_A=display_angpix_A,
+                        bar_length_A=scale_bar_length_A,
+                        target_frac=0.22,
+                        max_frac=0.33,
+                        label_unit="A",
+                    )
+
+
+                    if chosen_bar_A is not None and label_text:
+                        bar_px = int(round(float(chosen_bar_A) / float(display_angpix_A)))
+
+
+                        # Use the same text-rendering strategy as the micrograph
+                        scale_font_size = 28
+                        scale_thickness = 6
+                        text_gap = 6
+
+
+                        scale_font = load_font(scale_font_size, bold=False)
+                        label_img = render_text_crop(
+                            label_text,
+                            scale_font,
+                            fg=(0, 0, 0),
+                            bg=(255, 255, 255),
+                            pad=12,
+                            out_pad=3,
+                        )
+                        label_img = label_img.rotate(90, expand=True, fillcolor=(255, 255, 255))
+                        label_w, label_h = label_img.size
+
+
+                        d_page = ImageDraw.Draw(page)
+
+
+                        # Position in the white space left of the image, but on the page itself
+                        img_y0_px = cell_y0 + int(round(cell_h_px * img_y0_frac))
+                        img_x0_px = cell_x0 + int(round(cell_w_px * img_x0_frac))
+
+
+                        bar_x = max(8, img_x0_px - 18)
+                        bar_y0 = img_y0_px + int(round(0.10 * disp_img_h_px))
+                        bar_y1 = bar_y0 + bar_px - 1
+
+
+                        text_x = max(2, bar_x - text_gap - label_w)
+                        text_y = bar_y0 + (bar_px - label_h) // 2
+
+
+                        # Clamp fully inside the page
+                        text_x = max(0, min(page_w - label_w, text_x))
+                        text_y = max(0, min(page_h - label_h, text_y))
+                        bar_y0 = max(0, min(page_h - 1, bar_y0))
+                        bar_y1 = max(0, min(page_h - 1, bar_y1))
+
+
+                        d_page.rectangle(
+                            [bar_x, bar_y0, bar_x + scale_thickness - 1, bar_y1],
+                            fill=(0, 0, 0),
+                        )
+                        page.paste(label_img, (text_x, text_y))
+        
         pages.append(page)
 
     return pages
@@ -2440,8 +2787,12 @@ def make_micrograph_panel(
     micrograph_path = exp.get("micrograph_path") or exp.get("thumb_path")
     micrograph_psize_A = exp.get("micrograph_psize_A")
 
+    overlay_kwargs = get_pick_overlay_params(ws, exp)
+    micro_scale_bar_length_A = _pick_diameter_A_from_overlay_params(overlay_kwargs)
+
+
     if micrograph_path:
-        left_micro = mrc_2d_to_pil(
+        raw_micro = mrc_2d_to_pil(
             micrograph_path,
             invert=invert,
             display_mode=display_mode,
@@ -2458,37 +2809,194 @@ def make_micrograph_panel(
             origin="upper",
         )
 
-        overlay_kwargs = get_pick_overlay_params(ws, exp)
 
-        left_micro = overlay_blob_picks(
-            left_micro,
+        raw_micro = overlay_blob_picks(
+            raw_micro,
             exp.get("pick_cs_path"),
             **overlay_kwargs,
         )
 
-        left_micro = fit_within(left_micro, left_w, micrograph_h)
 
-        left_micro = add_plot_style_title_band(
-            left_micro.convert("RGB"),
-            "Micrograph",
-            canvas_size=(left_w, micrograph_h),
-            font_size=small_title_font_size,
-            title_h=small_title_band_h,
-            y_pad=small_title_y_pad,
-            bg=band_bg_color,
-            text_color=band_text_color,
-            font_weight=band_font_weight,
-            dpi=100,
+        panel_w = int(left_w)
+        panel_h = int(micrograph_h)
+        title_h = int(small_title_band_h)
+        content_h = panel_h - title_h
+
+
+        # Choose the scale bar from the full micrograph field width
+        source_micro_w = raw_micro.width
+
+
+        try:
+            micro_angpix = float(micrograph_psize_A) if micrograph_psize_A is not None else None
+        except Exception:
+            micro_angpix = None
+
+
+        chosen_bar_A = None
+        label_text = None
+
+
+        if (
+            choose_scale_bar_for_display is not None
+            and micro_angpix is not None
+            and np.isfinite(micro_angpix)
+            and micro_angpix > 0
+        ):
+            chosen_bar_A, label_text, _ = choose_scale_bar_for_display(
+                display_size_px=source_micro_w,
+                display_angpix_A=micro_angpix,
+                bar_length_A=None,
+                target_frac=0.22,
+                max_frac=0.33,
+                label_unit="nm",
+            )
+
+
+        # Compute the exact scale-bar strip height first
+        scale_font_size = 18
+        scale_thickness = 6
+        scale_top_margin = 0
+        scale_gap = 6
+        scale_bottom_margin = 3
+
+        scale_font = load_font(scale_font_size, bold=False)
+        tmp = Image.new("RGB", (20, 20), "white")
+        tmp_draw = ImageDraw.Draw(tmp)
+
+        if label_text:
+            label_img = render_text_crop(
+                label_text,
+                scale_font,
+                fg=(0, 0, 0),
+                bg=(255, 255, 255),
+                pad=12,
+            )
+            label_w, label_h = label_img.size
+        else:
+            label_img = None
+            label_w, label_h = 0, 0
+
+
+        scale_strip_h = scale_top_margin + scale_thickness + scale_gap + label_h + scale_bottom_margin + 2
+        image_h_budget = content_h - scale_strip_h
+
+
+        # Fit the micrograph into the exact remaining image area
+        left_micro_img = fit_within(raw_micro, panel_w, image_h_budget)
+
+
+        # Create final fixed-size micrograph panel
+        left_micro = Image.new("RGB", (panel_w, panel_h), bg_color)
+        d_micro = ImageDraw.Draw(left_micro)
+
+
+        # Title band
+        d_micro.rectangle([0, 0, panel_w, title_h], fill=band_bg_color)
+
+
+        title_font_obj = load_font(
+            small_title_font_size,
+            bold=(str(band_font_weight).lower() == "bold"),
         )
+
+
+        try:
+            tb = d_micro.textbbox((0, 0), "Micrograph", font=title_font_obj)
+            tw = tb[2] - tb[0]
+            th = tb[3] - tb[1]
+        except Exception:
+            tw, th = d_micro.textsize("Micrograph", font=title_font_obj)
+
+
+        tx = (panel_w - tw) // 2
+        ty = (title_h - th) // 2 - int(small_title_y_pad)
+        d_micro.text((tx, ty), "Micrograph", fill=band_text_color, font=title_font_obj)
+
+
+        # Paste micrograph into the image area
+        image_y0 = title_h
+        strip_y0 = title_h + image_h_budget
+
+
+        img_x = (panel_w - left_micro_img.width) // 2
+        img_y = image_y0 + (image_h_budget - left_micro_img.height) // 2
+        left_micro.paste(left_micro_img.convert("RGB"), (img_x, img_y))
+
+
+        # Draw scale bar in the reserved strip below the image
+        if (
+            chosen_bar_A is not None
+            and label_img is not None
+            and micro_angpix is not None
+            and left_micro_img.width > 0
+        ):
+            display_angpix_A = float(micro_angpix) * float(source_micro_w) / float(left_micro_img.width)
+            bar_px = int(round(float(chosen_bar_A) / float(display_angpix_A)))
+
+
+            side_margin_px = 16
+            x_left = img_x + side_margin_px
+            x_right = x_left + bar_px
+
+
+            y_bar_top = strip_y0 + scale_top_margin
+            y_bar_bottom = y_bar_top + scale_thickness
+            y_text = y_bar_bottom + scale_gap
+
+
+            x_text = x_left + (bar_px - label_w) // 2
+
+
+            d_micro.rectangle(
+                [x_left, y_bar_top, x_right, y_bar_bottom],
+                fill=(0, 0, 0),
+            )
+
+
+            left_micro.paste(label_img, (x_text, y_text))
+
+    else:
+        left_micro = Image.new("RGB", (left_w, micrograph_h), bg_color)
+        d_micro = ImageDraw.Draw(left_micro)
+        d_micro.rectangle([0, 0, left_w, small_title_band_h], fill=band_bg_color)
+
+
+        title_font_obj = load_font(
+            small_title_font_size,
+            bold=(str(band_font_weight).lower() == "bold"),
+        )
+        try:
+            tb = d_micro.textbbox((0, 0), "Micrograph", font=title_font_obj)
+            tw = tb[2] - tb[0]
+            th = tb[3] - tb[1]
+        except Exception:
+            tw, th = d_micro.textsize("Micrograph", font=title_font_obj)
+
+
+        tx = (left_w - tw) // 2
+        ty = (small_title_band_h - th) // 2 - int(small_title_y_pad)
+        d_micro.text((tx, ty), "Micrograph", fill=band_text_color, font=title_font_obj)
+
+
+        ph = make_placeholder(size=(left_w, micrograph_h - small_title_band_h), text="Micrograph unavailable")
+        ph = fit_within(ph, left_w, micrograph_h - small_title_band_h)
+        px = (left_w - ph.width) // 2
+        py = small_title_band_h + ((micrograph_h - small_title_band_h - ph.height) // 2)
+        left_micro.paste(ph, (px, py))
+
 
     # ------------------------------------------------------------------
     # Under micrograph: particles on left
     # ------------------------------------------------------------------
+    particles_cfg = dict(plot_cfg_full["particles"])
+    particles_cfg["scale_bar_length_A"] = micro_scale_bar_length_A
+
     particles_panel = make_particle_examples_panel(
         exp.get("particle_stack_path"),
         size=(under_left_w, under_micro_h),
         title="Particles",
-        cfg=plot_cfg_full["particles"],
+        cfg=particles_cfg,
         title_font_size=small_title_font_size,
         title_h=small_title_band_h,
         title_y_pad=small_title_y_pad,
@@ -2496,7 +3004,6 @@ def make_micrograph_panel(
         title_text_color=band_text_color,
         title_font_weight=band_font_weight,
     )
-    particles_panel = fit_within(particles_panel, under_left_w, under_micro_h)
 
     # ------------------------------------------------------------------
     # Under micrograph: global motion on right
