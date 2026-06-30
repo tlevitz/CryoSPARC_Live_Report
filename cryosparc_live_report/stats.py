@@ -7,6 +7,9 @@ import random
 import glob
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+import json
+import re
+from pathlib import Path
 
 import numpy as np
 
@@ -20,6 +23,8 @@ from .io import (
     fmt_num,
     fmt_pct,
 )
+
+
 
 def workspace_attribute_limits(ws: dict, name: str) -> Tuple[Optional[float], Optional[float]]:
     mins = []
@@ -140,6 +145,59 @@ def refine_status_label(ws: dict) -> str:
     if ws.get("phase2_refine_job"):
         return "Started"
     return ""
+
+def find_latest_iteration(folder: Path) -> int:
+    pattern = re.compile(r"^.+_(\d{3})_.+\.(mrc|cs)$")
+    iterations = []
+    for f in folder.iterdir():
+        if f.is_file():
+            m = pattern.match(f.name)
+            if m:
+                iterations.append(int(m.group(1)))
+    if not iterations:
+        raise FileNotFoundError(f"No iteration-style files found in {folder}")
+    return max(iterations)
+
+def load_gsfsc_from_job_json(folder: Path, iteration: int):
+    job_json = folder / "job.json"
+    if not job_json.exists():
+        return None
+
+
+    try:
+        data = json.loads(job_json.read_text())
+        for item in data.get("progress", []):
+            msg = str(item.get("message", "")).lower()
+            if f"iteration {iteration}" in msg and "gsfsc" in item:
+                return float(item["gsfsc"])
+    except Exception:
+        return None
+
+
+    return None
+
+def get_refine_gsfsc(project_dir: str, refine_job_uid: str):
+    """
+    Look up the latest-iteration GSFSC value for a refinement job by reading
+    its job.json.
+    """
+    if not project_dir or not refine_job_uid:
+        return None
+
+
+    job_dir = Path(project_dir) / str(refine_job_uid)
+    if not job_dir.is_dir():
+        return None
+
+
+    try:
+        iteration = find_latest_iteration(job_dir)
+    except Exception:
+        return None
+
+
+    return load_gsfsc_from_job_json(job_dir, iteration)
+
 
 def is_rejected_exp(exp: dict) -> bool:
     return bool(exp.get("manual_reject")) or bool(exp.get("threshold_reject"))
@@ -621,7 +679,13 @@ def summarize_vals(parsed: List[dict], key: str):
         return None, None, None
     return vals[0], float(np.median(vals)), vals[-1]
 
-def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_job_uid: Optional[str]):
+def build_summary_sections(
+    project: dict,
+    ws: dict,
+    parsed: List[dict],
+    class_job_uid: Optional[str],
+    project_dir: Optional[str] = None,
+):
     stats = ws.get("stats", {})
     params = ws.get("params", {})
     exp_groups = ws.get("exposure_groups", [])
@@ -713,11 +777,11 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
         ("Acceleration Voltage (kV)", fmt_num(params.get("accel_kv"), 1)),
         ("Spherical Aberration (mm)", fmt_num(params.get("cs_mm"), 2)),
 #        ("Total Dose (e/A2)", fmt_num(params.get("total_dose_e_per_A2"), 1)),
-#        ("CTF Resolution Min (A)", fmt_num(params.get("ctf_res_min_align"), 1)),
-#        ("CTF Resolution Max (A)", fmt_num(params.get("ctf_res_max_align"), 1)),
-        ("Best CTF Fit (A)", fmt_num(ctf_best, 2) if ctf_best is not None else ""),
-        ("Median CTF Fit (A)", fmt_num(ctf_med, 2) if ctf_med is not None else ""),
-        ("Worst CTF Fit (A)", fmt_num(ctf_worst, 2) if ctf_worst is not None else ""),
+#        ("CTF Resolution Min (Å)", fmt_num(params.get("ctf_res_min_align"), 1)),
+#        ("CTF Resolution Max (Å)", fmt_num(params.get("ctf_res_max_align"), 1)),
+        ("Best CTF Fit (Å)", fmt_num(ctf_best, 2) if ctf_best is not None else ""),
+        ("Median CTF Fit (Å)", fmt_num(ctf_med, 2) if ctf_med is not None else ""),
+        ("Worst CTF Fit (Å)", fmt_num(ctf_worst, 2) if ctf_worst is not None else ""),
 #        ("Median Max In-Frame Motion", fmt_num(mot_med, 3) if mot_med is not None else ""),
     ]
     sections.append({
@@ -754,15 +818,15 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
 
     if current_picker == "blob":
         picking_rows.extend([
-            ("Blob Diameter Min (A)", fmt_num(params.get("blob_diameter_min"), 0)),
-            ("Blob Diameter Max (A)", fmt_num(params.get("blob_diameter_max"), 0)),
+            ("Blob Diameter Min (Å)", fmt_num(params.get("blob_diameter_min"), 0)),
+            ("Blob Diameter Max (Å)", fmt_num(params.get("blob_diameter_max"), 0)),
             ("Blob Min Separation (diameters)", fmt_num(params.get("blob_min_distance"), 2)),
             ("Blob NCC Threshold Value", fmt_num(ncc_val, 3)),
 #            ("Blob NCC Threshold Min", fmt_num(ncc_min, 3)),
 #            ("Blob NCC Threshold Max", fmt_num(ncc_max, 3)),
             ("Blob Power Min", fmt_num(power_min, 3)),
             ("Blob Power Max", fmt_num(power_max, 3)),
-            ("Blob Lowpass (A)", fmt_num(params.get("blob_lowpass_res"), 0)),
+            ("Blob Lowpass (Å)", fmt_num(params.get("blob_lowpass_res"), 0)),
 #            ("Blob Angular Spacing (deg)", fmt_num(params.get("blob_angular_spacing_deg"), 1)),
             ("Blob Max Num Hits", str(params.get("blob_max_num_hits", ""))),
             ("Total Blob Picks", str(stats.get("total_blob_picks", ""))),
@@ -773,8 +837,8 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
 
         picking_rows.extend([
             ("Template Source", f"{template_creation_project} {template_creation_job}"),
-            ("Template Lowpass (A)", fmt_num(params.get("template_lowpass_res"), 0)),
-            ("Template Diameter (A)", fmt_num(params.get("template_diameter"), 0)),
+            ("Template Lowpass (Å)", fmt_num(params.get("template_lowpass_res"), 0)),
+            ("Template Diameter (Å)", fmt_num(params.get("template_diameter"), 0)),
 #            ("Template Angular Spacing (deg)", fmt_num(params.get("template_angular_spacing_deg"), 1)),
             ("Template Max Num Hits", str(params.get("template_max_num_hits", ""))),
             ("Template Min Separation (diameters)", fmt_num(params.get("template_min_distance"), 2)),
@@ -917,14 +981,18 @@ def build_summary_sections(project: dict, ws: dict, parsed: List[dict], class_jo
             or nested_get(ws, "phase2_refine_params_spec", "refine_symmetry")
         )
 
+        gsfsc = get_refine_gsfsc(project_dir, refine_job)
+
         refine_summary_html = (
-#            f'<font color="#3182bd"><b>Job:</b> {refine_job or ""}</font>'
             f'<font color="#3182bd"><b>Particles In:</b> {ws.get("phase2_refine_num_particles_in", "")}</font>'
             f'&nbsp;&nbsp;&nbsp;'
             f'<font color="#2ca25f"><b>Status:</b> {refine_status_label(ws)}</font>'
             f'&nbsp;&nbsp;&nbsp;'
             f'<font color="#756bb1"><b>Symmetry:</b> {str(refine_symmetry or "")}</font>'
-            f'&nbsp;&nbsp;&nbsp;'
+            + (
+                f'&nbsp;&nbsp;&nbsp;<font color="#dd1c77"><b>GSFSC (0.143):</b> {fmt_num(gsfsc, 2)} Å</font>'
+                if gsfsc is not None else ""
+            )
         )
 
         refine_rows = [

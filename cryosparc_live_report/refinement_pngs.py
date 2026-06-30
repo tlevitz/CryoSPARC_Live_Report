@@ -439,7 +439,7 @@ def save_stacked_mask_panel(mask_items, out_path: Path, title: str, cmap="viridi
     gs = fig.add_gridspec(
         nrows, 3,
         left=0.08, right=0.87, bottom=0.06, top=0.88,
-        hspace=0.9, wspace=0.24
+        hspace=0.65, wspace=0.24
     )
 
     all_row_axes = []
@@ -463,7 +463,7 @@ def save_stacked_mask_panel(mask_items, out_path: Path, title: str, cmap="viridi
         row_bb_left = row_axes[0].get_position()
         row_bb_right = row_axes[-1].get_position()
         x_center = 0.5 * (row_bb_left.x0 + row_bb_right.x1)
-        y_top = row_bb_left.y1
+        y_top = row_bb_left.y1 + 0.03
 
         fig.text(
             x_center,
@@ -679,19 +679,38 @@ def _make_facecolors_from_viewdir(normals, view_dir):
     facecolors[:, 3] = 1.0
     return facecolors
 
+def _compute_plot_lim(tri_verts, lim=None, margin=1.08):
+    """
+    Return a symmetric plot limit with extra breathing room.
+    If `lim` is None, compute it from the mesh.
+    """
+    base_lim = float(np.abs(tri_verts).max()) if lim is None else float(lim)
+    return base_lim * float(margin)
+
+
 def _render_surface_panel_image(tri_verts, normals, azim, elev, lim, panel_px, dpi, roll=0):
     """
     Render a single 3D surface view into an RGBA image.
+
+
+    `lim` is treated as a symmetric half-range around zero. A tiny extra
+    safety factor is applied internally so faces do not touch the axes edge.
     """
+    plot_lim = max(float(lim), 1e-6) * 1.01
+
+
     fig = plt.figure(
         figsize=(panel_px / dpi, panel_px / dpi),
         dpi=dpi,
-        facecolor="white"
+        facecolor="white",
     )
+
 
     ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], projection="3d", facecolor="white")
 
+
     facecolors = _make_facecolors(normals, azim, elev)
+
 
     mesh = Poly3DCollection(
         tri_verts,
@@ -702,18 +721,23 @@ def _render_surface_panel_image(tri_verts, normals, azim, elev, lim, panel_px, d
     )
     ax.add_collection3d(mesh)
 
+
     ax.set_proj_type("ortho")
-    ax.set_xlim(-lim, lim)
-    ax.set_ylim(-lim, lim)
-    ax.set_zlim(-lim, lim)
+    ax.set_xlim(-plot_lim, plot_lim)
+    ax.set_ylim(-plot_lim, plot_lim)
+    ax.set_zlim(-plot_lim, plot_lim)
     ax.set_box_aspect((1, 1, 1))
     ax.view_init(elev=elev, azim=azim, roll=roll)
     ax.set_axis_off()
+
 
     fig.canvas.draw()
     img = np.asarray(fig.canvas.buffer_rgba()).copy()
     plt.close(fig)
     return img
+
+
+
 
 def _render_surface_panel_projection_image(
     tri_verts,
@@ -729,16 +753,23 @@ def _render_surface_panel_projection_image(
     """
     Render a principal orthographic projection of the surface mesh into an RGBA image.
 
+
     horizontal_axis, vertical_axis, depth_axis are indices into x/y/z = 0/1/2.
 
-    The displayed convention is:
+
+    Displayed convention:
       - horizontal axis increases left -> right
       - vertical axis increases top -> bottom
+
 
     Since matplotlib 2D axes increase upward, we negate the vertical coordinate
     so that the requested axis increases downward in the final image.
     """
+    plot_lim = max(float(lim), 1e-6) * 1.01
+
+
     facecolors = _make_facecolors_from_viewdir(normals, view_dir)
+
 
     # Project triangles into 2D:
     #   u = chosen horizontal axis
@@ -747,9 +778,11 @@ def _render_surface_panel_projection_image(
     v = -tri_verts[:, :, vertical_axis]
     polys_2d = np.stack([u, v], axis=2)
 
+
     # Painter's algorithm: draw far faces first, near faces last
     depth = tri_verts.mean(axis=1)[:, depth_axis]
     order = np.argsort(depth)
+
 
     fig = plt.figure(
         figsize=(panel_px / dpi, panel_px / dpi),
@@ -757,7 +790,9 @@ def _render_surface_panel_projection_image(
         facecolor="white",
     )
 
+
     ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], facecolor="white")
+
 
     coll = PolyCollection(
         polys_2d[order],
@@ -768,30 +803,40 @@ def _render_surface_panel_projection_image(
     )
     ax.add_collection(coll)
 
-    ax.set_xlim(-lim, lim)
-    ax.set_ylim(-lim, lim)
+
+    ax.set_xlim(-plot_lim, plot_lim)
+    ax.set_ylim(-plot_lim, plot_lim)
     ax.set_aspect("equal")
     ax.set_axis_off()
+
 
     fig.canvas.draw()
     img = np.asarray(fig.canvas.buffer_rgba()).copy()
     plt.close(fig)
     return img
 
+
+
+
 def _crop_white_border(img, white_threshold=250, pad=8):
     """
     Crop away white border around a rendered RGBA image.
-    The crop is determined from the bounding box of non-white pixels.
-    A small safety pad is retained so we do not clip the rendered volume.
+
+
+    Kept here as a utility for other callers, but surface-view export below
+    intentionally does NOT use cropping so all panels stay at a consistent scale.
     """
     if img.ndim != 3 or img.shape[2] < 3:
         return img
 
+
     rgb = img[..., :3]
     nonwhite = np.any(rgb < white_threshold, axis=2)
 
+
     if not np.any(nonwhite):
         return img
+
 
     ys, xs = np.where(nonwhite)
     y0 = max(int(ys.min()) - pad, 0)
@@ -799,7 +844,10 @@ def _crop_white_border(img, white_threshold=250, pad=8):
     x0 = max(int(xs.min()) - pad, 0)
     x1 = min(int(xs.max()) + pad + 1, img.shape[1])
 
+
     return img[y0:y1, x0:x1]
+
+
 
 
 def _pad_to_square_canvas(img, side):
@@ -809,10 +857,13 @@ def _pad_to_square_canvas(img, side):
     h, w = img.shape[:2]
     out = np.full((side, side, img.shape[2]), 255, dtype=img.dtype)
 
+
     y0 = (side - h) // 2
     x0 = (side - w) // 2
     out[y0:y0 + h, x0:x0 + w] = img
     return out
+
+
 
 
 def save_surface_views(
@@ -827,6 +878,15 @@ def save_surface_views(
     embed_header=True,
     embed_plane_labels=True,
 ):
+    """
+    Save three principal orthographic surface projections (YZ, XZ, XY)
+    laid out side-by-side.
+
+
+    This version intentionally does NOT crop the rendered panel images.
+    Instead, it renders each panel at a consistent square size with a small
+    built-in plotting margin so the full object remains visible.
+    """
     fig_header_px = 110 if embed_header else 16
     fig_footer_px = 16
     left_px = 36
@@ -841,7 +901,7 @@ def save_surface_views(
     fig = plt.figure(
         figsize=(fig_w_px / dpi, fig_h_px / dpi),
         dpi=dpi,
-        facecolor="white"
+        facecolor="white",
     )
 
 
@@ -854,9 +914,12 @@ def save_surface_views(
         ax = fig.add_axes([0, 0, 1, 1])
         ax.axis("off")
         ax.text(
-            0.5, 0.5,
+            0.5,
+            0.5,
             "Surface render skipped:\nscikit-image not available",
-            ha="center", va="center", fontsize=REFINE_TEXT["title"]
+            ha="center",
+            va="center",
+            fontsize=REFINE_TEXT["title"],
         )
         fig.savefig(out_path, facecolor="white", dpi=dpi)
         plt.close(fig)
@@ -877,15 +940,20 @@ def save_surface_views(
         ax = fig.add_axes([0, 0, 1, 1])
         ax.axis("off")
         ax.text(
-            0.5, 0.5,
+            0.5,
+            0.5,
             f"Threshold {level:.3f} outside\nvolume range [{ds_min:.3f}, {ds_max:.3f}]",
-            ha="center", va="center", fontsize=REFINE_TEXT["title"]
+            ha="center",
+            va="center",
+            fontsize=REFINE_TEXT["title"],
         )
         fig.savefig(out_path, facecolor="white", dpi=dpi)
         plt.close(fig)
         return
 
+
     mc_spacing = tuple(float(s) * step for s in spacing[::-1])
+
 
     try:
         verts, faces, normals, values = marching_cubes(
@@ -898,51 +966,87 @@ def save_surface_views(
         ax = fig.add_axes([0, 0, 1, 1])
         ax.axis("off")
         ax.text(
-            0.5, 0.5,
+            0.5,
+            0.5,
             f"Surface render failed:\n{type(e).__name__}",
-            ha="center", va="center", fontsize=REFINE_TEXT["title"]
+            ha="center",
+            va="center",
+            fontsize=REFINE_TEXT["title"],
         )
         fig.savefig(out_path, facecolor="white", dpi=dpi)
         plt.close(fig)
         return
+
 
     max_faces = 250_000
     if len(faces) > max_faces:
         keep = np.linspace(0, len(faces) - 1, max_faces, dtype=np.int64)
         faces = faces[keep]
 
+
     verts = verts - verts.mean(axis=0)
     tri_verts = verts[faces]
 
-    fn = np.cross(tri_verts[:, 1] - tri_verts[:, 0], tri_verts[:, 2] - tri_verts[:, 0])
+
+    fn = np.cross(
+        tri_verts[:, 1] - tri_verts[:, 0],
+        tri_verts[:, 2] - tri_verts[:, 0],
+    )
     fn_norm = np.linalg.norm(fn, axis=1, keepdims=True)
     fn_norm[fn_norm == 0] = 1.0
     fn = fn / fn_norm
+
 
     face_centers = tri_verts.mean(axis=1)
     flip = np.sum(fn * face_centers, axis=1) < 0
     fn[flip] *= -1.0
 
+
     spans = np.ptp(verts, axis=0)
     max_span = float(np.max(spans))
     if max_span <= 0:
         max_span = 1.0
-    lim = 0.55 * max_span
+
+
+    # Base half-span is 0.5 * max_span.
+    # We expand slightly so the surface does not touch the render edges.
+    lim = 0.5 * max_span * 1.5
+
 
     # Principal projections matched to the slice conventions:
     #   XY: x increases left->right, y increases top->bottom
     #   YZ: y increases left->right, z increases top->bottom
     #   XZ: x increases left->right, z increases top->bottom
     principal_views = [
-        ("YZ Plane", dict(horizontal_axis=1, vertical_axis=2, depth_axis=0,
-                          view_dir=np.array([1.0, 0.0, 0.0], dtype=np.float32))),
-        ("XZ Plane", dict(horizontal_axis=0, vertical_axis=2, depth_axis=1,
-                          view_dir=np.array([0.0, 1.0, 0.0], dtype=np.float32))),
-        ("XY Plane", dict(horizontal_axis=0, vertical_axis=1, depth_axis=2,
-                          view_dir=np.array([0.0, 0.0, 1.0], dtype=np.float32))),
+        (
+            "YZ Plane",
+            dict(
+                horizontal_axis=1,
+                vertical_axis=2,
+                depth_axis=0,
+                view_dir=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            ),
+        ),
+        (
+            "XZ Plane",
+            dict(
+                horizontal_axis=0,
+                vertical_axis=2,
+                depth_axis=1,
+                view_dir=np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            ),
+        ),
+        (
+            "XY Plane",
+            dict(
+                horizontal_axis=0,
+                vertical_axis=1,
+                depth_axis=2,
+                view_dir=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+            ),
+        ),
     ]
 
-    crop_pad = max(6, panel_px // 100)
 
     rendered_panels = []
     for lab, cfg in principal_views:
@@ -957,18 +1061,7 @@ def save_surface_views(
             panel_px=panel_px,
             dpi=dpi,
         )
-
-        img = _crop_white_border(img, white_threshold=250, pad=crop_pad)
         rendered_panels.append((lab, img))
-
-    common_side = max(max(img.shape[0], img.shape[1]) for _, img in rendered_panels)
-    extra_margin_px = max(24, panel_px // 14)
-
-
-    rendered_panels = [
-        (lab, _pad_to_square_canvas(img, common_side + 2 * extra_margin_px))
-        for lab, img in rendered_panels
-    ]
 
 
     surface_label_fs = 8
@@ -979,24 +1072,29 @@ def save_surface_views(
         x0_px = left_px + i * (panel_px + gap_px)
 
 
-        ax = fig.add_axes([
-            x0_px / fig_w_px,
-            fig_footer_px / fig_h_px,
-            panel_px / fig_w_px,
-            panel_px / fig_h_px,
-        ], facecolor="white")
+        ax = fig.add_axes(
+            [
+                x0_px / fig_w_px,
+                fig_footer_px / fig_h_px,
+                panel_px / fig_w_px,
+                panel_px / fig_h_px,
+            ],
+            facecolor="white",
+        )
 
 
-        ax.imshow(img)
+        ax.imshow(img, interpolation="nearest")
         ax.set_axis_off()
 
 
         if embed_plane_labels:
             ax.text(
-                0.5, 0.02,
+                0.5,
+                0.0,
                 lab,
                 transform=ax.transAxes,
-                ha="center", va="bottom",
+                ha="center",
+                va="bottom",
                 fontsize=surface_label_fs,
                 bbox=dict(
                     boxstyle="round,pad=0.18",
@@ -1012,10 +1110,12 @@ def save_surface_views(
 
     if embed_header:
         fig.text(
-            0.5, 0.985,
+            0.5,
+            0.985,
             f"{title}\nThreshold: {level:.3f}    Min: {vmin:.3f}    Max: {vmax:.3f}    "
             f"Voxel size: {vx:.3f} Å/px",
-            ha="center", va="top",
+            ha="center",
+            va="top",
             fontsize=surface_header_fs,
             linespacing=1.15,
         )
@@ -1023,6 +1123,8 @@ def save_surface_views(
 
     fig.savefig(out_path, facecolor="white", dpi=dpi)
     plt.close(fig)
+
+
 
 
 # ============================================================

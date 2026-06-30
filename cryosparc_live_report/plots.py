@@ -77,8 +77,8 @@ def render_single_scatterplot(
             pts["accepted"][0],
             pts["accepted"][1],
             s=cfg["marker_size_accepted"],
-            alpha=0.7,
-            c="#0000ff",
+            alpha=1,
+            c="#47c16eff",
             label="accepted",
         )
     if pts["rejected"][0]:
@@ -86,8 +86,8 @@ def render_single_scatterplot(
             pts["rejected"][0],
             pts["rejected"][1],
             s=cfg["marker_size_rejected"],
-            alpha=0.8,
-            c="#de2d26",
+            alpha=1,
+            c="#481f70ff",
             label="rejected",
         )
     if pts["other"][0]:
@@ -95,7 +95,7 @@ def render_single_scatterplot(
             pts["other"][0],
             pts["other"][1],
             s=cfg["marker_size_other"],
-            alpha=0.5,
+            alpha=1,
             c="#888888",
             label="other",
         )

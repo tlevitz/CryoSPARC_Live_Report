@@ -840,7 +840,8 @@ def overlay_blob_picks(
 
             x = float(row["location/center_x_frac"]) * w
             y_frac = float(row["location/center_y_frac"])
-            y = (y_frac if gainref_flip_y else (1.0 - y_frac)) * h
+#            y = (y_frac if gainref_flip_y else (1.0 - y_frac)) * h
+            y = (y_frac * h)
 
             if callable(fill_alpha):
                 a = int(fill_alpha(row, i, len(rows_to_draw)))
