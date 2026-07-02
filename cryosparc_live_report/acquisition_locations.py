@@ -1,6 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Acquisition-location parsing and rendering helpers for CryoSPARC Live reports.
+
+
+Direct dependencies
+-------------------
+- numpy
+- pandas
+- matplotlib
+- Pillow
+
+
+Standard library dependencies
+-----------------------------
+- os
+- re
+- traceback
+- io
+- pathlib
+- typing
+- functools
+- xml.etree.ElementTree
+"""
 
 import os
 import re
@@ -190,25 +213,6 @@ def parse_timestamp(s):
 
 
 
-
-def _find_first_local(root, local_name: str):
-    for e in root.iter():
-        if _ln(e.tag) == local_name:
-            return e
-    return None
-
-
-
-
-def _find_direct_child(elem, local_name: str):
-    for ch in list(elem):
-        if _ln(ch.tag) == local_name:
-            return ch
-    return None
-
-
-
-
 def _extract_xy_from_element(elem, x_names=("X", "_x", "x"), y_names=("Y", "_y", "y")):
     x = None
     y = None
@@ -278,14 +282,6 @@ def _find_first_numeric_by_keys(obj, wanted_keys):
 
     rec(obj)
     return found[0] if found else None
-
-
-@lru_cache(maxsize=None)
-def _dir_file_index(dir_path: str):
-    try:
-        return {p.name: str(p) for p in Path(dir_path).iterdir() if p.is_file()}
-    except Exception:
-        return {}
 
 
 def extract_ctf_fit_A(exp: dict):
@@ -1849,20 +1845,6 @@ def _set_min_equal_range(ax, x, y, min_range=None, pad_frac=0.04):
     ax.set_ylim(ymid - span / 2.0, ymid + span / 2.0)
 
 
-def _marker_area_from_axes(ax, frac_of_axis=0.012, min_diameter_pt=0.5, max_diameter_pt=6.0):
-    """
-    Return scatter marker area (pt^2), with diameter scaled to figure/axes size.
-    """
-    ax.figure.canvas.draw()
-
-    axis_size_px = min(ax.bbox.width, ax.bbox.height)
-    diameter_px = frac_of_axis * axis_size_px
-
-    diameter_pt = diameter_px * 36.0 / ax.figure.dpi
-    diameter_pt = float(np.clip(diameter_pt, min_diameter_pt, max_diameter_pt))
-
-    return diameter_pt ** 2
-
 def _marker_area_from_data_diameter(
     ax,
     diameter_data_units: float,
@@ -1918,21 +1900,26 @@ def render_location_ctf_image(
     if df is None or df.empty:
         raise ValueError("render_location_ctf_image got empty dataframe")
 
+
     if "plot_x" not in df.columns or "plot_y" not in df.columns:
         raise ValueError("Dataframe must contain plot_x and plot_y")
+
 
     if "ctf_fit_A" in df.columns:
         ctf_vals = pd.to_numeric(df["ctf_fit_A"], errors="coerce")
     else:
         ctf_vals = pd.Series(np.nan, index=df.index, dtype=float)
 
+
     if "unit_label" in df.columns and df["unit_label"].notna().any():
         unit_label = str(df["unit_label"].dropna().iloc[0])
     else:
         unit_label = ""
 
+
     x_plot = pd.to_numeric(df["plot_x"], errors="coerce")
     y_plot = pd.to_numeric(df["plot_y"], errors="coerce")
+
 
     if mode == "epu" and rotate_epu_ccw:
         x_disp = -y_plot
@@ -1941,16 +1928,19 @@ def render_location_ctf_image(
         x_disp = x_plot
         y_disp = y_plot
 
+
     valid_xy = x_disp.notna() & y_disp.notna()
     x_disp = x_disp.loc[valid_xy]
     y_disp = y_disp.loc[valid_xy]
     ctf_vals = ctf_vals.loc[valid_xy]
 
+
     valid_ctf = ctf_vals.notna()
+
 
     fig, ax = plt.subplots(figsize=(8.8, 8.0), dpi=400)
 
-    # Set view range first
+
     if min_axis_range_um is not None:
         _set_min_equal_range(
             ax,
@@ -1960,10 +1950,11 @@ def render_location_ctf_image(
             pad_frac=0.04,
         )
 
+
     ax.set_aspect("equal", adjustable="box")
     fig.canvas.draw()
 
-    # Color scaling
+
     if ctf_vmin is None or ctf_vmax is None:
         if valid_ctf.any():
             auto_vmin, auto_vmax = auto_ctf_range(
@@ -1976,12 +1967,13 @@ def render_location_ctf_image(
         else:
             auto_vmin, auto_vmax = (4.0, 12.0)
 
+
         if ctf_vmin is None:
             ctf_vmin = auto_vmin
         if ctf_vmax is None:
             ctf_vmax = auto_vmax
 
-    # Marker sizing
+
     if auto_point_size:
         scatter_size = _marker_area_from_data_diameter(
             ax,
@@ -1992,13 +1984,14 @@ def render_location_ctf_image(
     else:
         scatter_size = 16.0 if point_size is None else float(point_size)
 
-    if valid_ctf.any():
-        
-        xv = x_disp.to_numpy()
-        yv = y_disp.to_numpy()
-        cv = ctf_vals.to_numpy()
-        mask = np.isfinite(cv)
-        
+
+    xv = x_disp.to_numpy()
+    yv = y_disp.to_numpy()
+    cv = ctf_vals.to_numpy()
+    mask = np.isfinite(cv)
+
+
+    if np.any(mask):
         sc = ax.scatter(
             xv[mask],
             yv[mask],
@@ -2023,8 +2016,8 @@ def render_location_ctf_image(
         cbar.set_label("CTF fit (Å)")
     else:
         ax.scatter(
-            x_disp,
-            y_disp,
+            xv,
+            yv,
             color="0.55",
             s=scatter_size,
             alpha=0.8,
@@ -2033,7 +2026,8 @@ def render_location_ctf_image(
             zorder=2,
         )
 
-    if (~mask).any():
+
+    if np.any(~mask):
         ax.scatter(
             xv[~mask],
             yv[~mask],
@@ -2045,9 +2039,11 @@ def render_location_ctf_image(
             zorder=1,
         )
 
+
     ax.set_xlabel(f"X ({unit_label})" if unit_label else "X")
     ax.set_ylabel(f"Y ({unit_label})" if unit_label else "Y")
     ax.grid(False)
+
 
     fig.tight_layout()
     return _fig_to_pil(fig)

@@ -1,25 +1,57 @@
 #!/usr/bin/env python3
 
+
+"""
+Refinement and initial-model PNG generation helpers for CryoSPARC Live reports.
+
+
+Direct dependencies
+-------------------
+- numpy
+- mrcfile
+- matplotlib
+- scipy
+- Pillow
+
+
+Optional dependency
+-------------------
+- scikit-image
+
+
+Local dependencies
+------------------
+- cryosparc_live_report.textstyle
+- cryosparc_live_report.scale_bars
+"""
+
+
 import argparse
 import json
 import re
 from pathlib import Path
 
+
 import numpy as np
 import mrcfile
+
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from matplotlib import transforms
 from matplotlib.collections import PolyCollection
+
 
 from scipy.ndimage import gaussian_filter, gaussian_filter1d
 from scipy.spatial.transform import Rotation
 
+
 from PIL import Image, ImageDraw, ImageFont
+
+
+
 
 try:
     from skimage.measure import marching_cubes
@@ -27,10 +59,28 @@ try:
 except Exception:
     HAVE_SKIMAGE = False
 
+
+
+
 try:
     from cryosparc_live_report.textstyle import build_refinement_text_settings
 except Exception:
-    print("no textstyle subscript")
+    def build_refinement_text_settings(text_theme=None, overrides=None):
+        cfg = {
+            "title": 12,
+            "axis": 10,
+            "tick": 10,
+            "legend": 10,
+            "colorbar": 10,
+            "panel_label": 12,
+            "annotation": 10,
+            "big_number": 20,
+            "surface_header": 9,
+            "surface_label": 8,
+        }
+        if overrides:
+            cfg.update(overrides)
+        return cfg
 
 try:
     from cryosparc_live_report.scale_bars import choose_scale_bar_for_display
@@ -38,6 +88,7 @@ except Exception:
     choose_scale_bar_for_display = None
 
 REFINE_TEXT = build_refinement_text_settings()
+
 
 def set_refinement_text_theme(text_theme=None, overrides=None):
     global REFINE_TEXT
@@ -443,6 +494,7 @@ def save_slice_panel(
 ):
     slices = get_slices_yz_xz_xy(vol)
 
+
     if manual_vmax is not None:
         vmax = abs(float(manual_vmax))
         vmin = -vmax
@@ -451,12 +503,14 @@ def save_slice_panel(
     else:
         vmin, vmax = robust_limits(vol)
 
+
     fig = plt.figure(figsize=(13.4, 4.9), dpi=200)
     gs = fig.add_gridspec(
         1, 3,
         left=0.06, right=0.87, bottom=0.12, top=0.83,
         wspace=0.24
     )
+
 
     axes = []
     last_im = None
@@ -467,20 +521,16 @@ def save_slice_panel(
         axes.append(ax)
         last_im = im
 
-    if embed_title:
-        if gsfsc_value is not None and np.isfinite(gsfsc_value):
-            ax.set_title(
-                f"FSC (0.143 = {gsfsc_value:.2f} Å)",
-                fontsize=REFINE_TEXT["title"]
-            )
-        else:
-            ax.set_title("FSC", fontsize=REFINE_TEXT["title"])
 
-    # single-row-height colorbar
+    if embed_title and title:
+        fig.suptitle(title, fontsize=REFINE_TEXT["title"], y=0.96)
+
+
     bb = axes[-1].get_position()
     cax = fig.add_axes([0.90, bb.y0, 0.018, bb.height])
     cb = fig.colorbar(last_im, cax=cax)
     cb.ax.tick_params(labelsize=REFINE_TEXT["colorbar"])
+
 
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -542,7 +592,7 @@ def save_stacked_mask_panel(mask_items, out_path: Path, title: str, cmap="viridi
 
         all_row_axes.append(row_axes)
 
-    if embed_title:
+    if embed_title and title:
         fig.suptitle(title, fontsize=REFINE_TEXT["title"], y=0.965)
 
     # Colorbar
@@ -2273,6 +2323,7 @@ def save_protein_view_lookup(
     # volume is indexed as vol[z, y, x], so marching_cubes spacing must follow (z, y, x)
     mc_spacing = tuple(float(s) * step for s in spacing[::-1])
 
+
     try:
         verts, faces, normals, values = marching_cubes(
             ds,
@@ -2314,6 +2365,7 @@ def save_protein_view_lookup(
     if max_span <= 0:
         max_span = 1.0
     lim = 0.55 * max_span
+
 
     # Simple bin-center logic from the second script
     az_edges = np.linspace(-np.pi, np.pi, 9, dtype=np.float64)

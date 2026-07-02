@@ -2,6 +2,23 @@
 # coding: utf-8
 
 
+"""
+Scatterplot rendering helpers for CryoSPARC Live reports.
+
+
+Direct dependencies
+-------------------
+- matplotlib
+- Pillow
+
+
+Local dependencies
+------------------
+- cryosparc_live_report.stats
+- cryosparc_live_report.textstyle
+"""
+
+
 from io import BytesIO
 from typing import List, Tuple, Optional
 
@@ -13,11 +30,8 @@ from PIL import Image
 
 
 from .stats import workspace_attribute_limits
-from .images import merge_nested_dicts
-from generate_live_report import build_report_text_theme
 
-
-
+from .textstyle import merge_nested_dicts, build_report_text_theme
 
 def build_scatterplot_style(
     text_theme: Optional[dict] = None,
@@ -171,7 +185,6 @@ def render_single_scatterplot(
 
 
 ALL_PLOT_SPECS = [
-    # ---- default 7 ----
     {
         "key": "elapsed_minutes",
         "title": "Time Since Start",
@@ -235,9 +248,6 @@ ALL_PLOT_SPECS = [
         "default": True,
         "replaceable": True,
     },
-
-
-    # ---- additional scatterplots ----
     {
         "key": "defocus_range",
         "title": "Defocus Range",
@@ -424,24 +434,18 @@ def build_scatterplot_pages(
     extra_plots_with_limits = [s for s in extra_plots if s["has_workspace_limit"]]
 
 
-    # Case 1:
-    # No extra limited plots -> keep original behavior
     if not extra_plots_with_limits:
         return [
             ("Session Scatterplots", [(s["title"], s["img"]) for s in default_plots])
         ]
 
 
-    # Only Time Since Start / Total Particles Extracted can be replaced,
-    # and only if they themselves do not have workspace limits.
     replaceable_defaults = [
         s for s in default_plots
         if s.get("replaceable", False) and not s["has_workspace_limit"]
     ]
 
 
-    # Case 2:
-    # 1-2 extra limited plots can replace 1-2 replaceable defaults
     if 1 <= len(extra_plots_with_limits) <= 2 and len(replaceable_defaults) >= len(extra_plots_with_limits):
         titles_to_replace = {
             s["title"] for s in replaceable_defaults[:len(extra_plots_with_limits)]
@@ -457,8 +461,6 @@ def build_scatterplot_pages(
         ]
 
 
-    # Case 3:
-    # Keep all 7 current scatterplots on page 1, extras on continuation page(s)
     pages = [
         ("Session Scatterplots", [(s["title"], s["img"]) for s in default_plots])
     ]
@@ -475,13 +477,15 @@ def build_scatterplot_pages(
 
 
 
-# Backward-compatible wrapper
 def build_scatterplots(
     parsed: List[dict],
     ws: dict,
     text_theme: Optional[dict] = None,
     style: Optional[dict] = None,
 ) -> List[Tuple[str, Image.Image]]:
+    """
+    Backward-compatible wrapper returning only the first page's plots.
+    """
     pages = build_scatterplot_pages(
         parsed=parsed,
         ws=ws,

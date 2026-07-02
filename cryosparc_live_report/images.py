@@ -1,6 +1,33 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
+"""
+Image rendering and panel-construction helpers for CryoSPARC Live reports.
+
+
+Direct dependencies
+-------------------
+- matplotlib
+- mrcfile
+- numpy
+- Pillow
+- scipy
+- scikit-image
+
+
+Optional/local dependencies
+---------------------------
+- cryosparc_live_report.stats
+- cryosparc_live_report.scale_bars
+
+
+Notes
+-----
+Some helper logic in this module overlaps with functionality also defined in
+`textstyle.py` and `generate_live_report.py`. That duplication should be
+resolved only after reviewing all module consumers.
+"""
+
 import io
 import math
 from io import BytesIO
@@ -26,14 +53,10 @@ from skimage.filters import butterworth
 from functools import lru_cache
 
 try:
-    from cryosparc.tools import Dataset
-except Exception:
-    Dataset = None
-
-try:
     from .stats import get_picking_threshold, get_threshold_block
 except Exception:
-    pass
+    get_picking_threshold = None
+    get_threshold_block = None
 
 try:
     RESAMPLE = Image.Resampling.LANCZOS
@@ -42,14 +65,10 @@ except Exception:
 
 try:
     from .scale_bars import (
-        add_bottom_scale_bar_pil,
-        add_inset_scale_bar_pil,
         choose_scale_bar_for_display,
         format_length,
     )
 except Exception:
-    add_bottom_scale_bar_pil = None
-    add_inset_scale_bar_pil = None
     choose_scale_bar_for_display = None
     format_length=None
 
@@ -842,12 +861,14 @@ def get_pick_overlay_params(ws: dict, exp: dict) -> dict:
     params = ws.get("params", {}) or {}
     stats = ws.get("stats", {}) or {}
 
+
     picker_type = (
         exp.get("pick_picker_type")
         or exp.get("picker_type")
         or str(params.get("current_picker") or "").strip().lower()
         or None
     )
+
 
     source_micrograph_shape = None
     try:
@@ -858,16 +879,31 @@ def get_pick_overlay_params(ws: dict, exp: dict) -> dict:
     except Exception:
         source_micrograph_shape = None
 
+
     picker = str(picker_type or "").strip().lower()
 
-    ncc_min = ncc_val = ncc_max = None
-    power_min = power_max = None
 
-    if picker:
-        ncc_min, ncc_val, ncc_max = get_picking_threshold(ws, f"{picker}_ncc_score")
-        power_block = get_threshold_block(ws, f"{picker}_power") or {}
-        power_min = power_block.get("min")
-        power_max = power_block.get("max")
+    ncc_val = None
+    power_min = None
+    power_max = None
+
+
+    if picker and callable(get_picking_threshold):
+        try:
+            _ncc_min, ncc_val, _ncc_max = get_picking_threshold(ws, f"{picker}_ncc_score")
+        except Exception:
+            ncc_val = None
+
+
+    if picker and callable(get_threshold_block):
+        try:
+            power_block = get_threshold_block(ws, f"{picker}_power") or {}
+            power_min = power_block.get("min")
+            power_max = power_block.get("max")
+        except Exception:
+            power_min = None
+            power_max = None
+
 
     return {
         "picker_type": picker_type,
@@ -880,6 +916,8 @@ def get_pick_overlay_params(ws: dict, exp: dict) -> dict:
         "power_min": power_min,
         "power_max": power_max,
     }
+
+
 
 def _pick_diameter_A_from_overlay_params(p: dict):
     if not isinstance(p, dict):

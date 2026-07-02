@@ -1,7 +1,27 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
-from typing import List, Tuple, Optional
+
+"""
+PDF page/layout helpers for CryoSPARC Live reports.
+
+
+Direct dependencies
+-------------------
+- reportlab
+- Pillow
+
+
+Optional local dependencies
+---------------------------
+- epu.report_style
+- epu.report_utils
+
+
+If the optional `epu` modules are unavailable, this module falls back to
+basic built-in fonts, sizes, and drawing helpers.
+"""
+
 
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -9,7 +29,11 @@ from reportlab.platypus import Frame, Paragraph, Spacer, Table, TableStyle, Keep
 from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader, simpleSplit
 
+
 from PIL import Image, ImageChops
+
+
+
 
 try:
     from epu.report_style import (
@@ -22,6 +46,9 @@ except Exception:
     RL_FONT_FAMILY_BOLD = "Helvetica-Bold"
     PDF_FONT_SIZES = {"title": 16, "body": 9, "caption": 8}
 
+
+
+
 try:
     from epu.report_utils import draw_heading, draw_page_number, draw_frame_box
 except Exception:
@@ -30,24 +57,51 @@ except Exception:
         c.drawString(x, y, text)
         return y - (0.30 * inch if level == "title" else 0.20 * inch)
 
+
     def draw_page_number(c, page_num, width, margin):
         c.setFont(RL_FONT_FAMILY, 9)
         c.drawRightString(width - margin, 0.35 * inch, f"Page {page_num}")
 
+
     def draw_frame_box(c, x, y_top, w, h):
         c.rect(x, y_top - h, w, h, stroke=1, fill=0)
-        
+
+
+
+
+REFINE_PANEL_TITLES = {
+    "surface_views": "Surface Views",
+    "real_space_slices": "Real Space Slices",
+    "per_particle_scale": "Per-Particle Scale",
+    "fsc": "FSC",
+    "guinier": "Guinier Plot",
+    "mask_slices": "Mask Slices",
+    "viewing_direction": "Viewing Directions",
+    "posterior_precision": "Posterior Precision",
+    "protein_view_lookup": "Protein View Lookup",
+}
+
+
+
+
 def _prepare_pdf_image(pil_img, draw_w_pt, draw_h_pt, max_dpi=450):
     """
     Prepare a PIL image for compact PDF embedding.
 
 
     - Flattens alpha onto white
-    - Converts RGB->L if the image is actually grayscale
+    - Converts RGB -> L if the image is actually grayscale
     - Downsamples to the maximum useful pixel size for the drawn size
 
 
-    draw_w_pt / draw_h_pt are the final on-page dimensions in points.
+    Parameters
+    ----------
+    pil_img
+        PIL image to prepare.
+    draw_w_pt, draw_h_pt
+        Final on-page drawn dimensions in points.
+    max_dpi
+        Maximum raster density to preserve for embedded output.
     """
     if pil_img is None:
         return None
@@ -56,7 +110,6 @@ def _prepare_pdf_image(pil_img, draw_w_pt, draw_h_pt, max_dpi=450):
     img = pil_img
 
 
-    # Flatten transparency onto white so we do not need mask="auto"
     if img.mode in ("RGBA", "LA"):
         bg = Image.new("RGB", img.size, "white")
         alpha = img.getchannel("A") if "A" in img.getbands() else None
@@ -68,20 +121,18 @@ def _prepare_pdf_image(pil_img, draw_w_pt, draw_h_pt, max_dpi=450):
         img = img.convert("RGB")
 
 
-    # If image is really grayscale, store as L instead of RGB
     if img.mode == "RGB":
         try:
             r, g, b = img.split()
             if (
-                ImageChops.difference(r, g).getbbox() is None and
-                ImageChops.difference(r, b).getbbox() is None
+                ImageChops.difference(r, g).getbbox() is None
+                and ImageChops.difference(r, b).getbbox() is None
             ):
                 img = img.convert("L")
         except Exception:
             pass
 
 
-    # Compute maximum useful raster size for the actual drawn size
     target_px_w = max(1, int(round(draw_w_pt / 72.0 * max_dpi)))
     target_px_h = max(1, int(round(draw_h_pt / 72.0 * max_dpi)))
 
@@ -103,48 +154,54 @@ def _prepare_pdf_image(pil_img, draw_w_pt, draw_h_pt, max_dpi=450):
 
 
 
+def _draw_note_block(
+    c,
+    note,
+    x_left,
+    y_top,
+    max_w,
+    font_name="Helvetica-Oblique",
+    font_size=8,
+    leading=11,
+    bottom_gap=6,
+):
+    """
+    Draw a wrapped note block and return the new y position below it.
+    """
+    if not note:
+        return y_top
+
+
+    note_lines = simpleSplit(note, font_name, font_size, max_w)
+
+
+    c.setFont(font_name, font_size)
+    note_y = y_top - 2
+    for line in note_lines:
+        c.drawString(x_left, note_y, line)
+        note_y -= leading
+
+
+    return note_y - bottom_gap
+
+
+
+
 def render_framed_pil(c, pil_img, x_left, y_top, max_w, max_h, frame_pad=4.0):
     iw, ih = pil_img.size
-    scale = min((max_w - 2 * frame_pad) / max(iw, 1), (max_h - 2 * frame_pad) / max(ih, 1))
+    scale = min(
+        (max_w - 2 * frame_pad) / max(iw, 1),
+        (max_h - 2 * frame_pad) / max(ih, 1),
+    )
     dw, dh = iw * scale, ih * scale
     total_h = dh + 2 * frame_pad
+
+
     draw_frame_box(c, x_left, y_top, max_w, total_h)
+
+
     x_img = x_left + frame_pad + (max_w - 2 * frame_pad - dw) / 2.0
     y_img = y_top - frame_pad - dh
-
-
-    prepped = _prepare_pdf_image(pil_img, dw, dh, max_dpi=450)
-    c.drawImage(ImageReader(prepped), x_img, y_img, width=dw, height=dh, preserveAspectRatio=True)
-
-
-    return total_h
-
-def render_framed_pil_in_box(c, pil_img, x_left, y_top, box_w, box_h, frame_pad=4.0):
-    draw_frame_box(c, x_left, y_top, box_w, box_h)
-
-
-    if pil_img is None:
-        return box_h
-
-
-    iw, ih = pil_img.size
-    if iw <= 0 or ih <= 0:
-        return box_h
-
-
-    scale = min(
-        (box_w - 2 * frame_pad) / float(iw),
-        (box_h - 2 * frame_pad) / float(ih),
-    )
-    scale = max(scale, 0.0)
-
-
-    dw = iw * scale
-    dh = ih * scale
-
-
-    x_img = x_left + (box_w - dw) / 2.0
-    y_img = y_top - box_h + (box_h - dh) / 2.0
 
 
     prepped = _prepare_pdf_image(pil_img, dw, dh, max_dpi=450)
@@ -156,34 +213,19 @@ def render_framed_pil_in_box(c, pil_img, x_left, y_top, box_w, box_h, frame_pad=
         height=dh,
         preserveAspectRatio=True,
     )
-    return box_h
 
 
-def draw_missing_panel(c, x_left, y_top, box_w, box_h, label="Not available"):
-    draw_frame_box(c, x_left, y_top, box_w, box_h)
-    c.setFont(RL_FONT_FAMILY, 9)
-    c.setFillColor(colors.grey)
-    c.drawCentredString(x_left + box_w / 2.0, y_top - box_h / 2.0, label)
-    c.setFillColor(colors.black)
+    return total_h
 
-
-REFINE_PANEL_TITLES = {
-    "surface_views": "Surface Views",
-    "real_space_slices": "Real Space Slices",
-    "per_particle_scale": "Per-Particle Scale",
-    "fsc": "FSC",
-    "guinier": "Guinier Plot",
-    "mask_slices": "Mask Slices",
-    "viewing_direction": "Viewing Directions",
-    "posterior_precision": "Posterior Precision",
-    "protein_view_lookup": "Protein View Lookup",
-}
 
 
 
 
 def _panel_title_for_key(key: str) -> str:
     return REFINE_PANEL_TITLES.get(key, key.replace("_", " ").title())
+
+
+
 
 def draw_titled_panel_in_box(
     c,
@@ -200,26 +242,18 @@ def draw_titled_panel_in_box(
     draw_separator=True,
 ):
     """
-    Draw a single framed panel where the title lives inside the top of the box
-    and the image is centered in the remaining area.
-
-
-    This preserves uniform final title size because the title is still rendered
-    at PDF time, after the panel size is known.
+    Draw a framed panel with title inside the top band and image centered below.
     """
-    # Outer frame around the entire panel, including title band
     draw_frame_box(c, x_left, y_top, box_w, box_h)
 
 
     inner_pad = frame_pad
 
 
-    # Wrap title to panel width
     text_w = max(box_w - 2 * inner_pad - 2, 10)
     lines = simpleSplit(title, RL_FONT_FAMILY_BOLD, title_fontsize, text_w)
 
 
-    # Keep title compact
     if len(lines) > 2:
         lines = lines[:2]
         if len(lines[1]) > 3:
@@ -230,7 +264,6 @@ def draw_titled_panel_in_box(
     title_band_h = max(min_title_band_h, len(lines) * line_h + 6)
 
 
-    # Draw title centered inside top band
     c.setFont(RL_FONT_FAMILY_BOLD, title_fontsize)
     text_y = y_top - title_fontsize - 2
     for line in lines:
@@ -238,13 +271,11 @@ def draw_titled_panel_in_box(
         text_y -= line_h
 
 
-    # Optional separator line between title band and image region
     img_region_top = y_top - title_band_h
     if draw_separator:
         c.line(x_left, img_region_top, x_left + box_w, img_region_top)
 
 
-    # Available area for image inside same outer frame
     avail_w = box_w - 2 * inner_pad
     avail_h = box_h - title_band_h - title_gap - 2 * inner_pad
 
@@ -285,6 +316,7 @@ def draw_titled_panel_in_box(
     x_img = img_x0 + (avail_w - dw) / 2.0
     y_img = img_y_top - dh - (avail_h - dh) / 2.0
 
+
     prepped = _prepare_pdf_image(pil_img, dw, dh, max_dpi=450)
     c.drawImage(
         ImageReader(prepped),
@@ -297,6 +329,9 @@ def draw_titled_panel_in_box(
 
 
     return box_h
+
+
+
 
 def add_summary_pages(c, width, height, margin, project_folder_name, sections, page_num_start=1):
     page_num = page_num_start
@@ -368,7 +403,7 @@ def add_summary_pages(c, width, height, margin, project_folder_name, sections, p
         avail_w,
         avail_h,
         content,
-        mode="shrink",   # only shrinks if needed
+        mode="shrink",
         hAlign="LEFT",
         vAlign="TOP",
     )
@@ -384,24 +419,26 @@ def add_summary_pages(c, width, height, margin, project_folder_name, sections, p
     return page_num + 1
 
 
+
+
 def draw_single_image_page(c, page_num, width, height, margin, heading, pil_img, note=None):
     y = height - margin
     y = draw_heading(c, heading, margin, y, level="section", page_height=height, margin=margin)
+
+
     if note:
-        note_font = "Helvetica-Oblique"
-        note_size = 8
-        note_leading = 11
-        note_width = width - 2 * margin
+        y = _draw_note_block(
+            c,
+            note,
+            margin,
+            y,
+            width - 2 * margin,
+            font_name="Helvetica-Oblique",
+            font_size=8,
+            leading=11,
+            bottom_gap=6,
+        )
 
-        note_lines = simpleSplit(note, note_font, note_size, note_width)
-
-        c.setFont(note_font, note_size)
-        note_y = y - 2
-        for line in note_lines:
-            c.drawString(margin, note_y, line)
-            note_y -= note_leading
-
-        y = note_y - 6
 
     render_framed_pil(c, pil_img, margin, y, width - 2 * margin, y - margin)
     draw_page_number(c, page_num, width, margin)
@@ -409,53 +446,52 @@ def draw_single_image_page(c, page_num, width, height, margin, heading, pil_img,
     return page_num + 1
 
 
+
+
 def draw_five_plot_page(c, page_num, width, height, margin, heading, plots, note=None):
     if not plots:
         return page_num
 
-    y = height - margin
 
+    y = height - margin
     y = draw_heading(c, heading, margin, y, level="section", page_height=height, margin=margin)
 
+
     if note:
-        note_font = "Helvetica-Oblique"
-        note_size = 8
-        note_leading = 11
-        note_width = width - 2 * margin
+        y = _draw_note_block(
+            c,
+            note,
+            margin,
+            y,
+            width - 2 * margin,
+            font_name="Helvetica-Oblique",
+            font_size=8,
+            leading=11,
+            bottom_gap=6,
+        )
 
-        note_lines = simpleSplit(note, note_font, note_size, note_width)
-
-        c.setFont(note_font, note_size)
-        note_y = y - 2
-        for line in note_lines:
-            c.drawString(margin, note_y, line)
-            note_y -= note_leading
-
-        y = note_y - 6
 
     max_w = width - 2 * margin
 
-    # More generous spacing so titles do not touch plot frames
+
     inter_block_gap = 0.15 * inch
     title_band_h = 0.04 * inch
     title_to_box_gap = 0.08 * inch
 
+
     nplots = len(plots)
     avail_h = y - margin
-
     total_reserved = nplots * (title_band_h + title_to_box_gap) + (nplots - 1) * inter_block_gap
     plot_h = (avail_h - total_reserved) / float(nplots)
 
+
     for i, (title, plot_img) in enumerate(plots):
-        # Title
         c.setFont(RL_FONT_FAMILY_BOLD, 9)
         c.drawString(margin, y - 1, title)
         y -= title_band_h
-
-        # Small gap between title and framed plot
         y -= title_to_box_gap
 
-        # Plot image
+
         used_h = render_framed_pil(
             c,
             plot_img,
@@ -467,13 +503,17 @@ def draw_five_plot_page(c, page_num, width, height, margin, heading, plots, note
         )
         y -= used_h
 
-        # Gap before next block
+
         if i < nplots - 1:
             y -= inter_block_gap
+
 
     draw_page_number(c, page_num, width, margin)
     c.showPage()
     return page_num + 1
+
+
+
 
 def draw_panel_pages(c, page_num, width, height, margin, heading, panels, note=None):
     """
@@ -482,13 +522,13 @@ def draw_panel_pages(c, page_num, width, height, margin, heading, panels, note=N
     if not panels:
         return page_num
 
+
     idx = 0
     cols = 2
     rows = 2
-
-    # Slightly tighter gaps than before
     gap_x = 0.08 * inch
     gap_y = 0.10 * inch
+
 
     while idx < len(panels):
         y = height - margin
@@ -502,35 +542,38 @@ def draw_panel_pages(c, page_num, width, height, margin, heading, panels, note=N
             margin=margin,
         )
 
+
         if idx == 0 and note:
-            note_font = "Helvetica-Oblique"
-            note_size = 8
-            note_leading = 10
-            note_width = width - 2 * margin
+            y = _draw_note_block(
+                c,
+                note,
+                margin,
+                y,
+                width - 2 * margin,
+                font_name="Helvetica-Oblique",
+                font_size=8,
+                leading=10,
+                bottom_gap=4,
+            )
 
-            note_lines = simpleSplit(note, note_font, note_size, note_width)
-
-            c.setFont(note_font, note_size)
-            note_y = y - 2
-            for line in note_lines:
-                c.drawString(margin, note_y, line)
-                note_y -= note_leading
-
-            y = note_y - 4
 
         avail_w = width - 2 * margin
         avail_h = y - margin
 
+
         cell_w = (avail_w - (cols - 1) * gap_x) / cols
         cell_h = (avail_h - (rows - 1) * gap_y) / rows
+
 
         for r in range(rows):
             for col in range(cols):
                 if idx >= len(panels):
                     break
 
+
                 x = margin + col * (cell_w + gap_x)
                 y_top = y - r * (cell_h + gap_y)
+
 
                 render_framed_pil(
                     c,
@@ -539,15 +582,20 @@ def draw_panel_pages(c, page_num, width, height, margin, heading, panels, note=N
                     y_top,
                     cell_w,
                     cell_h,
-                    frame_pad=1.5,   # smaller than before so the image gets more room
+                    frame_pad=1.5,
                 )
                 idx += 1
+
 
         draw_page_number(c, page_num, width, margin)
         c.showPage()
         page_num += 1
 
+
     return page_num
+
+
+
 
 def draw_initial_model_summary_pages(c, page_num, width, height, margin, heading, class_panels, note=None):
     """
@@ -589,23 +637,17 @@ def draw_initial_model_summary_pages(c, page_num, width, height, margin, heading
 
 
         if idx == 0 and note:
-            note_font = "Helvetica-Oblique"
-            note_size = 8
-            note_leading = 11
-            note_width = width - 2 * margin
-
-
-            note_lines = simpleSplit(note, note_font, note_size, note_width)
-            c.setFont(note_font, note_size)
-
-
-            note_y = y - 2
-            for line in note_lines:
-                c.drawString(margin, note_y, line)
-                note_y -= note_leading
-
-
-            y = note_y - 6
+            y = _draw_note_block(
+                c,
+                note,
+                margin,
+                y,
+                width - 2 * margin,
+                font_name="Helvetica-Oblique",
+                font_size=8,
+                leading=11,
+                bottom_gap=6,
+            )
 
 
         avail_w = width - 2 * margin
@@ -648,6 +690,9 @@ def draw_initial_model_summary_pages(c, page_num, width, height, margin, heading
 
     return page_num
 
+
+
+
 def draw_refinement_summary_page(c, page_num, width, height, margin, heading, panel_map, note=None):
     """
     Layout:
@@ -661,23 +706,17 @@ def draw_refinement_summary_page(c, page_num, width, height, margin, heading, pa
 
 
     if note:
-        note_font = "Helvetica-Oblique"
-        note_size = 8
-        note_leading = 11
-        note_width = width - 2 * margin
-
-
-        note_lines = simpleSplit(note, note_font, note_size, note_width)
-        c.setFont(note_font, note_size)
-
-
-        note_y = y - 2
-        for line in note_lines:
-            c.drawString(margin, note_y, line)
-            note_y -= note_leading
-
-
-        y = note_y - 6
+        y = _draw_note_block(
+            c,
+            note,
+            margin,
+            y,
+            width - 2 * margin,
+            font_name="Helvetica-Oblique",
+            font_size=8,
+            leading=11,
+            bottom_gap=6,
+        )
 
 
     avail_w = width - 2 * margin
@@ -746,3 +785,5 @@ def draw_refinement_summary_page(c, page_num, width, height, margin, heading, pa
     draw_page_number(c, page_num, width, margin)
     c.showPage()
     return page_num + 1
+
+

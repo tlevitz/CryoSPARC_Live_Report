@@ -2,6 +2,22 @@
 # coding: utf-8
 
 
+"""
+Scale-bar helpers for PIL images and matplotlib axes.
+
+
+Direct dependencies
+-------------------
+- Pillow
+
+
+Standard library dependencies
+-----------------------------
+- math
+- typing
+"""
+
+
 import math
 from typing import Optional, Tuple
 
@@ -12,6 +28,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 def load_font(size=16, bold=False):
+    """
+    Load a reasonable sans-serif font if available, otherwise fall back to
+    PIL's default font.
+    """
     candidates = []
     if bold:
         candidates += [
@@ -40,6 +60,9 @@ def load_font(size=16, bold=False):
 
 
 def format_length(length_A: float, unit_mode: str = "A") -> str:
+    """
+    Format a physical length in Å or nm.
+    """
     try:
         x = float(length_A)
     except Exception:
@@ -73,6 +96,9 @@ def choose_nice_scale_bar_length_A(
     max_frac: float = 0.33,
     allowed_A=None,
 ) -> Optional[float]:
+    """
+    Choose a visually reasonable scale-bar length in Å for a field of view.
+    """
     try:
         field_size_A = float(field_size_A)
     except Exception:
@@ -113,6 +139,9 @@ def choose_scale_bar_for_display(
     max_frac: float = 0.33,
     label_unit: str = "A",
 ) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+    """
+    Choose scale-bar length, formatted label, and field-of-view fraction.
+    """
     try:
         display_size_px = int(display_size_px)
         display_angpix_A = float(display_angpix_A)
@@ -150,6 +179,9 @@ def choose_scale_bar_for_display(
 
 
 def _text_size(draw, text, font):
+    """
+    Measure text size across Pillow versions.
+    """
     try:
         bbox = draw.textbbox((0, 0), text, font=font)
         return bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -177,6 +209,9 @@ def add_bottom_scale_bar_pil(
     max_frac: float = 0.33,
     label_unit: str = "A",
 ) -> Image.Image:
+    """
+    Add a scale bar in a new white strip below the image.
+    """
     if img is None:
         return img
 
@@ -263,6 +298,9 @@ def add_inset_scale_bar_pil(
     max_frac: float = 0.33,
     label_unit: str = "A",
 ) -> Image.Image:
+    """
+    Draw a scale bar directly inside the image near the bottom edge.
+    """
     if img is None:
         return img
 
@@ -314,6 +352,8 @@ def add_inset_scale_bar_pil(
         x_left = W - side_margin_px - bar_px
     else:
         x_left = side_margin_px
+
+
     x_right = x_left + bar_px
     x_text = x_left + (bar_px - text_w) // 2
 
@@ -344,6 +384,9 @@ def add_vertical_scale_bar_to_axes_fraction(
     text_dx: float = 0.05,
     zorder: int = 50,
 ):
+    """
+    Draw a vertical scale bar in matplotlib axes coordinates.
+    """
     try:
         length_frac = float(length_frac)
         x = float(x)
