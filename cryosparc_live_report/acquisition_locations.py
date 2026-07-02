@@ -8,7 +8,7 @@ import traceback
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
-
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -73,6 +73,69 @@ def _safe_resolve_file(p: str) -> Optional[Path]:
     except Exception:
         pass
     return None
+
+
+def _decode_text_maybe(v):
+    if isinstance(v, (bytes, np.bytes_)):
+        return v.decode("utf-8", errors="ignore")
+    if v is None:
+        return None
+    return str(v)
+
+
+
+
+def normalize_acquisition_key(pathlike) -> Optional[str]:
+    """
+    Normalize raw movies, motion-corrected micrographs, and particle-stack paths
+    to a shared EPU exposure key.
+
+
+    We intentionally match only the stable prefix up to the timestamp:
+        FoilHole_<uniq>_Data_<t1>_<t2>_<YYYYMMDD>_<HHMMSS>
+
+
+    This avoids mismatches between:
+        ..._Fractions
+        ..._Fractions_0000000482
+        ..._patch_aligned_doseweighted
+        ..._particles_<hash>
+    """
+    s = _decode_text_maybe(pathlike)
+    if not s:
+        return None
+
+
+    name = Path(s).name
+
+
+    m = re.search(
+        r"(FoilHole_[A-Za-z0-9]+_Data_[^_]+_[^_]+_\d{8}_\d{6})",
+        name,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+
+
+    # fallback
+    name = re.sub(r"\.(mrc|mrcs|tif|tiff|eer|xml|mdoc)$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"_particles(?:_[0-9a-fA-F]+)?$", "", name, flags=re.IGNORECASE)
+
+
+    changed = True
+    while changed:
+        old = name
+        name = re.sub(
+            r"_(patch_aligned_doseweighted|patch_aligned|aligned_doseweighted|doseweighted|aligned)$",
+            "",
+            name,
+            flags=re.IGNORECASE,
+        )
+        changed = (name != old)
+
+
+    return name or None
 
 
 
@@ -217,6 +280,12 @@ def _find_first_numeric_by_keys(obj, wanted_keys):
     return found[0] if found else None
 
 
+@lru_cache(maxsize=None)
+def _dir_file_index(dir_path: str):
+    try:
+        return {p.name: str(p) for p in Path(dir_path).iterdir() if p.is_file()}
+    except Exception:
+        return {}
 
 
 def extract_ctf_fit_A(exp: dict):
@@ -380,13 +449,10 @@ def find_epu_session_root_from_movie(movie_path: str) -> Optional[str]:
 # finding original movie paths
 # ----------------------------
 
-
 def get_exposure_movie_candidates(parsed_exp: dict, project_dir: str) -> List[str]:
     out = []
 
-
     raw = parsed_exp.get("raw") or {}
-
 
     movie_rel = _unwrap_singleton(
         _nested_get(raw, "groups", "exposure", "movie_blob", "path")
@@ -397,72 +463,70 @@ def get_exposure_movie_candidates(parsed_exp: dict, project_dir: str) -> List[st
         else:
             out.append(os.path.join(project_dir, movie_rel))
 
-
     abs_file_path = parsed_exp.get("abs_file_path")
     if isinstance(abs_file_path, str) and abs_file_path not in ("", "."):
         out.append(abs_file_path)
 
+    # Deduplicate by resolved real path where possible
+    dedup = []
+    seen = set()
+    for p in out:
+        rp = _safe_resolve_file(p)
+        key = str(rp) if rp is not None else str(Path(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(p)
 
-    return _unique_keep_order(out)
-
-
-
+    return dedup
 
 # ----------------------------
 # EPU sidecar XML matching
 # ----------------------------
 
+@lru_cache(maxsize=None)
+def _find_matching_epu_xml_cached(resolved_movie_path: str) -> Optional[str]:
+    """
+    Search for an EPU XML next to the fully resolved target movie.
+    """
+    movie = Path(resolved_movie_path)
+    if not movie.exists():
+        return None
+
+    parent = movie.parent
+    files = _dir_file_index(str(parent))
+
+    stem = movie.stem
+    base_no_fractions = re.sub(r"_Fractions(?:_\d+)?$", "", stem, flags=re.IGNORECASE)
+
+    if f"{base_no_fractions}.xml" in files:
+        return files[f"{base_no_fractions}.xml"]
+
+    if f"{stem}.xml" in files:
+        return files[f"{stem}.xml"]
+
+    # relaxed fallback
+    for name, fullpath in files.items():
+        if name.lower().endswith(".xml"):
+            if name.startswith(base_no_fractions) or name.startswith(stem):
+                return fullpath
+
+    return None
+
 
 def find_matching_epu_xml(movie_path: str) -> Optional[str]:
     """
-    Prefer the EPU micrograph XML with 'Fractions' removed from the basename.
-    Fall back to the exact movie stem XML if needed.
+    Resolve symlinks first so we search in the real raw-data directory.
     """
     movie = _safe_resolve_file(movie_path)
     if movie is None:
         return None
 
-
-    parent = movie.parent
-    stem = movie.stem
-    base_no_fractions = re.sub(r"_Fractions(?:_\d+)?$", "", stem, flags=re.IGNORECASE)
-
-
-    preferred = [
-        parent / f"{base_no_fractions}.xml",
-    ]
-    for cand in preferred:
-        if cand.is_file():
-            return str(cand)
-
-
-    fallback = [
-        parent / f"{stem}.xml",
-    ]
-    for cand in fallback:
-        if cand.is_file():
-            return str(cand)
-
-
-    relaxed_patterns = [
-        f"{base_no_fractions}*.xml",
-        f"{stem}*.xml",
-    ]
-    for pat in relaxed_patterns:
-        hits = sorted(parent.glob(pat))
-        if hits:
-            return str(hits[0])
-
-
-    return None
-
-
-
+    return _find_matching_epu_xml_cached(str(movie))
 
 # ----------------------------
 # SerialEM sidecar MDOC matching
 # ----------------------------
-
 
 def _serialem_mdoc_names_for_movie(movie: Path) -> List[str]:
     return _unique_keep_order([
@@ -471,18 +535,30 @@ def _serialem_mdoc_names_for_movie(movie: Path) -> List[str]:
     ])
 
 
+@lru_cache(maxsize=None)
+def _dir_file_index(dir_path: str) -> Dict[str, str]:
+    """
+    Cache directory contents as {filename: full_path}.
+    """
+    try:
+        d = Path(dir_path)
+        return {p.name: str(p) for p in d.iterdir() if p.is_file()}
+    except Exception:
+        return {}
 
 
-def find_matching_serialem_mdoc(movie_path: str) -> Optional[str]:
-    movie = _safe_resolve_file(movie_path)
-    if movie is None:
+@lru_cache(maxsize=None)
+def _find_matching_serialem_mdoc_cached(resolved_movie_path: str) -> Optional[str]:
+    """
+    Internal cached lookup. Expects a fully resolved movie path.
+    """
+    movie = Path(resolved_movie_path)
+    if not movie.is_file():
         return None
-
 
     names = _serialem_mdoc_names_for_movie(movie)
     movie_dir = movie.parent
     parent_dir = movie_dir.parent
-
 
     search_dirs = [
         movie_dir,
@@ -491,18 +567,27 @@ def find_matching_serialem_mdoc(movie_path: str) -> Optional[str]:
         parent_dir / "mdocs",
     ]
 
-
     for d in search_dirs:
+        files = _dir_file_index(str(d))
         for name in names:
-            cand = d / name
-            if cand.is_file():
-                return str(cand)
-
+            hit = files.get(name)
+            if hit:
+                return hit
 
     return None
 
 
+def find_matching_serialem_mdoc(movie_path: str) -> Optional[str]:
+    """
+    Public wrapper:
+    - resolves symlinks first so search happens next to the real target file
+    - then uses cached lookup
+    """
+    movie = _safe_resolve_file(movie_path)
+    if movie is None:
+        return None
 
+    return _find_matching_serialem_mdoc_cached(str(movie))
 
 # ----------------------------
 # acquisition mode detection
@@ -512,7 +597,7 @@ def find_matching_serialem_mdoc(movie_path: str) -> Optional[str]:
 def detect_acquisition_mode(
     project_dir: str,
     parsed: List[dict],
-    max_check: int = 40,
+    max_check: int = 10,
 ) -> Tuple[Optional[str], Dict[str, int]]:
     xml_hits = 0
     mdoc_hits = 0
@@ -532,12 +617,10 @@ def detect_acquisition_mode(
         for movie_path in candidates:
             checked_movies += 1
 
-
             xml_hit = find_matching_epu_xml(movie_path)
             if xml_hit:
                 xml_hits += 1
                 break
-
 
             mdoc_hit = find_matching_serialem_mdoc(movie_path)
             if mdoc_hit:
@@ -573,7 +656,6 @@ def detect_acquisition_mode(
 # namespace-agnostic
 # ----------------------------
 
-
 def parse_epu_xml_location(xml_path: str) -> dict:
     out = {
         "stage_x": np.nan,
@@ -599,8 +681,9 @@ def parse_epu_xml_location(xml_path: str) -> dict:
     out["image_shift_y"] = isy if isy is not None else np.nan
     return out
 
-
-
+@lru_cache(maxsize=None)
+def parse_epu_xml_location_cached(xml_path: str) -> dict:
+    return parse_epu_xml_location(xml_path)
 
 # ----------------------------
 # EPU GridSquare helpers
@@ -1091,7 +1174,7 @@ def build_epu_locations_without_atlas(
         micrograph_xml = find_matching_epu_xml(resolved_movie)
         if micrograph_xml:
             if micrograph_xml not in micrograph_meta_cache:
-                micrograph_meta_cache[micrograph_xml] = parse_epu_xml_location(micrograph_xml)
+                micrograph_meta_cache[micrograph_xml] = parse_epu_xml_location_cached(micrograph_xml)
             micro_meta = micrograph_meta_cache[micrograph_xml]
             image_shift_x = micro_meta.get("image_shift_x", np.nan)
             image_shift_y = micro_meta.get("image_shift_y", np.nan)
@@ -1349,7 +1432,9 @@ def parse_serialem_mdoc_location(mdoc_path: str) -> dict:
 
     return out
 
-
+@lru_cache(maxsize=None)
+def parse_serialem_mdoc_location_cached(mdoc_path: str) -> dict:
+    return parse_serialem_mdoc_location(mdoc_path)
 
 
 # ----------------------------
@@ -1438,7 +1523,7 @@ def build_location_dataframe(
             continue
 
 
-        meta = parse_serialem_mdoc_location(sidecar_path)
+        meta = parse_serialem_mdoc_location_cached(sidecar_path)
         stage_x = meta["stage_x"]
         stage_y = meta["stage_y"]
         isx = meta["image_shift_x"]
@@ -1451,7 +1536,7 @@ def build_location_dataframe(
 
         x_plot = x
         y_plot = y
-        unit_label = "SerialEM units"
+        unit_label = "µm"
 
 
         if not (np.isfinite(x_plot) and np.isfinite(y_plot)):
@@ -1525,35 +1610,75 @@ def auto_ctf_range(
 
     return vmin, vmax
 
+def auto_scalar_range(
+    df: pd.DataFrame,
+    col: str,
+    lower_pct: float = 10.0,
+    upper_pct: float = 90.0,
+    fallback: Tuple[float, float] = (1.0, 10.0),
+    positive_only: bool = True,
+) -> Tuple[float, float]:
+    vals = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy()
+
+
+    if positive_only:
+        vals = vals[vals > 0]
+
+
+    if vals.size == 0:
+        return fallback
+
+
+    vmin = float(np.percentile(vals, lower_pct))
+    vmax = float(np.percentile(vals, upper_pct))
+
+
+    if positive_only:
+        vmin = max(vmin, 1.0e-12)
+
+
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        return fallback
+
+
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+
+
+    return vmin, vmax
 
 
 
-def render_location_ctf_image(
+
+def render_location_scalar_image(
     df: pd.DataFrame,
     mode: str,
     session_name: str,
-    ctf_vmin: Optional[float] = None,
-    ctf_vmax: Optional[float] = None,
-    point_size: float = 0.8,
-    cmap: str = "viridis",
+    value_col: str = "scalar_value",
+    value_label: str = "Value",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    point_size: Optional[float] = None,
+    cmap: str = "viridis_r",
     auto_percentiles: Tuple[float, float] = (10.0, 90.0),
     rotate_epu_ccw: bool = True,
+    min_axis_range_um: Optional[float] = 300.0,
+    auto_point_size: bool = True,
+    point_diameter_um: float = 2.0,
+    min_point_diameter_pt: float = 0.5,
+    max_point_diameter_pt: float = 6.0,
+    zero_color: str = "0.78",
 ) -> Image.Image:
     if df is None or df.empty:
-        raise ValueError("render_location_ctf_image got empty dataframe")
+        raise ValueError("render_location_scalar_image got empty dataframe")
 
 
     if "plot_x" not in df.columns or "plot_y" not in df.columns:
         raise ValueError("Dataframe must contain plot_x and plot_y")
 
 
-    if "ctf_fit_A" in df.columns:
-        ctf_vals = pd.to_numeric(df["ctf_fit_A"], errors="coerce")
-    else:
-        ctf_vals = pd.Series(np.nan, index=df.index, dtype=float)
-
-
-    valid_ctf = ctf_vals.notna()
+    if value_col not in df.columns:
+        raise ValueError(f"Dataframe must contain {value_col}")
 
 
     if "unit_label" in df.columns and df["unit_label"].notna().any():
@@ -1564,6 +1689,7 @@ def render_location_ctf_image(
 
     x_plot = pd.to_numeric(df["plot_x"], errors="coerce")
     y_plot = pd.to_numeric(df["plot_y"], errors="coerce")
+    vals = pd.to_numeric(df[value_col], errors="coerce").fillna(0.0)
 
 
     if mode == "epu" and rotate_epu_ccw:
@@ -1574,9 +1700,270 @@ def render_location_ctf_image(
         y_disp = y_plot
 
 
+    valid_xy = x_disp.notna() & y_disp.notna()
+    x_disp = x_disp.loc[valid_xy]
+    y_disp = y_disp.loc[valid_xy]
+    vals = vals.loc[valid_xy]
+
+
     fig, ax = plt.subplots(figsize=(8.8, 8.0), dpi=400)
 
 
+    if min_axis_range_um is not None:
+        _set_min_equal_range(
+            ax,
+            x_disp.to_numpy(),
+            y_disp.to_numpy(),
+            min_range=min_axis_range_um,
+            pad_frac=0.04,
+        )
+
+
+    ax.set_aspect("equal", adjustable="box")
+    fig.canvas.draw()
+
+
+    if auto_point_size:
+        scatter_size = _marker_area_from_data_diameter(
+            ax,
+            diameter_data_units=point_diameter_um,
+            min_diameter_pt=min_point_diameter_pt,
+            max_diameter_pt=max_point_diameter_pt,
+        )
+    else:
+        scatter_size = 16.0 if point_size is None else float(point_size)
+
+
+    positive_mask = vals > 0
+    zero_mask = ~positive_mask
+
+
+    if vmin is None or vmax is None:
+        auto_vmin, auto_vmax = auto_scalar_range(
+            pd.DataFrame({value_col: vals}),
+            col=value_col,
+            lower_pct=auto_percentiles[0],
+            upper_pct=auto_percentiles[1],
+            fallback=(1.0, 10.0),
+            positive_only=True,
+        )
+        if vmin is None:
+            vmin = auto_vmin
+        if vmax is None:
+            vmax = auto_vmax
+
+
+    xv = x_disp.to_numpy()
+    yv = y_disp.to_numpy()
+    vv = vals.to_numpy()
+    zmask = zero_mask.to_numpy()
+    pmask = positive_mask.to_numpy()
+
+
+    if np.any(zmask):
+        ax.scatter(
+            xv[zmask],
+            yv[zmask],
+            color=zero_color,
+            s=scatter_size,
+            alpha=0.9,
+            linewidths=0,
+            edgecolors="none",
+            zorder=1,
+        )
+
+
+    if np.any(pmask):
+        sc = ax.scatter(
+            xv[pmask],
+            yv[pmask],
+            c=vv[pmask],
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            s=scatter_size,
+            alpha=1.0,
+            linewidths=0,
+            edgecolors="none",
+            zorder=2,
+        )
+        cbar = fig.colorbar(
+            sc,
+            ax=ax,
+            orientation="horizontal",
+            fraction=0.06,
+            pad=0.08,
+            aspect=40,
+        )
+        cbar.set_label(value_label)
+
+
+    ax.set_xlabel(f"X ({unit_label})" if unit_label else "X")
+    ax.set_ylabel(f"Y ({unit_label})" if unit_label else "Y")
+    ax.grid(False)
+
+
+    fig.tight_layout()
+    return _fig_to_pil(fig)
+
+
+
+
+def _set_min_equal_range(ax, x, y, min_range=None, pad_frac=0.04):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    if not np.any(mask):
+        return
+
+
+    x = x[mask]
+    y = y[mask]
+
+
+    xmin, xmax = np.min(x), np.max(x)
+    ymin, ymax = np.min(y), np.max(y)
+
+
+    span = max(xmax - xmin, ymax - ymin)
+
+
+    if not np.isfinite(span) or span <= 0:
+        span = 1.0
+
+
+    span *= (1.0 + pad_frac)
+
+
+    if min_range is not None:
+        span = max(span, float(min_range))
+
+
+    xmid = 0.5 * (xmin + xmax)
+    ymid = 0.5 * (ymin + ymax)
+
+
+    ax.set_xlim(xmid - span / 2.0, xmid + span / 2.0)
+    ax.set_ylim(ymid - span / 2.0, ymid + span / 2.0)
+
+
+def _marker_area_from_axes(ax, frac_of_axis=0.012, min_diameter_pt=0.5, max_diameter_pt=6.0):
+    """
+    Return scatter marker area (pt^2), with diameter scaled to figure/axes size.
+    """
+    ax.figure.canvas.draw()
+
+    axis_size_px = min(ax.bbox.width, ax.bbox.height)
+    diameter_px = frac_of_axis * axis_size_px
+
+    diameter_pt = diameter_px * 36.0 / ax.figure.dpi
+    diameter_pt = float(np.clip(diameter_pt, min_diameter_pt, max_diameter_pt))
+
+    return diameter_pt ** 2
+
+def _marker_area_from_data_diameter(
+    ax,
+    diameter_data_units: float,
+    min_diameter_pt: float = 0.5,
+    max_diameter_pt: float = 6,
+):
+    """
+    Convert a desired marker diameter in data units into scatter area (pt^2),
+    based on the current axis limits and rendered axis size.
+
+    If the visible axis span doubles, the marker diameter on screen halves.
+    """
+    fig = ax.figure
+    fig.canvas.draw()
+
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+
+    xspan = abs(x1 - x0)
+    yspan = abs(y1 - y0)
+
+    if xspan <= 0 or yspan <= 0:
+        return min_diameter_pt ** 2
+
+    px_per_unit_x = ax.bbox.width / xspan
+    px_per_unit_y = ax.bbox.height / yspan
+
+    # Use the smaller one so circles stay reasonable if aspect/layout changes
+    px_per_unit = min(px_per_unit_x, px_per_unit_y)
+
+    diameter_px = float(diameter_data_units) * px_per_unit
+    diameter_pt = diameter_px * 36.0 / fig.dpi
+    diameter_pt = float(np.clip(diameter_pt, min_diameter_pt, max_diameter_pt))
+
+    return diameter_pt ** 2
+
+def render_location_ctf_image(
+    df: pd.DataFrame,
+    mode: str,
+    session_name: str,
+    ctf_vmin: Optional[float] = None,
+    ctf_vmax: Optional[float] = None,
+    point_size: Optional[float] = None,
+    cmap: str = "viridis",
+    auto_percentiles: Tuple[float, float] = (10.0, 90.0),
+    rotate_epu_ccw: bool = True,
+    min_axis_range_um: Optional[float] = 300.0,
+    auto_point_size: bool = True,
+    point_diameter_um: float = 2.0,
+    min_point_diameter_pt: float = 0.5,
+    max_point_diameter_pt: float = 6.0,
+) -> Image.Image:
+    if df is None or df.empty:
+        raise ValueError("render_location_ctf_image got empty dataframe")
+
+    if "plot_x" not in df.columns or "plot_y" not in df.columns:
+        raise ValueError("Dataframe must contain plot_x and plot_y")
+
+    if "ctf_fit_A" in df.columns:
+        ctf_vals = pd.to_numeric(df["ctf_fit_A"], errors="coerce")
+    else:
+        ctf_vals = pd.Series(np.nan, index=df.index, dtype=float)
+
+    if "unit_label" in df.columns and df["unit_label"].notna().any():
+        unit_label = str(df["unit_label"].dropna().iloc[0])
+    else:
+        unit_label = ""
+
+    x_plot = pd.to_numeric(df["plot_x"], errors="coerce")
+    y_plot = pd.to_numeric(df["plot_y"], errors="coerce")
+
+    if mode == "epu" and rotate_epu_ccw:
+        x_disp = -y_plot
+        y_disp = x_plot
+    else:
+        x_disp = x_plot
+        y_disp = y_plot
+
+    valid_xy = x_disp.notna() & y_disp.notna()
+    x_disp = x_disp.loc[valid_xy]
+    y_disp = y_disp.loc[valid_xy]
+    ctf_vals = ctf_vals.loc[valid_xy]
+
+    valid_ctf = ctf_vals.notna()
+
+    fig, ax = plt.subplots(figsize=(8.8, 8.0), dpi=400)
+
+    # Set view range first
+    if min_axis_range_um is not None:
+        _set_min_equal_range(
+            ax,
+            x_disp.to_numpy(),
+            y_disp.to_numpy(),
+            min_range=min_axis_range_um,
+            pad_frac=0.04,
+        )
+
+    ax.set_aspect("equal", adjustable="box")
+    fig.canvas.draw()
+
+    # Color scaling
     if ctf_vmin is None or ctf_vmax is None:
         if valid_ctf.any():
             auto_vmin, auto_vmax = auto_ctf_range(
@@ -1589,23 +1976,38 @@ def render_location_ctf_image(
         else:
             auto_vmin, auto_vmax = (4.0, 12.0)
 
-
         if ctf_vmin is None:
             ctf_vmin = auto_vmin
         if ctf_vmax is None:
             ctf_vmax = auto_vmax
 
+    # Marker sizing
+    if auto_point_size:
+        scatter_size = _marker_area_from_data_diameter(
+            ax,
+            diameter_data_units=point_diameter_um,
+            min_diameter_pt=min_point_diameter_pt,
+            max_diameter_pt=max_point_diameter_pt,
+        )
+    else:
+        scatter_size = 16.0 if point_size is None else float(point_size)
 
     if valid_ctf.any():
+        
+        xv = x_disp.to_numpy()
+        yv = y_disp.to_numpy()
+        cv = ctf_vals.to_numpy()
+        mask = np.isfinite(cv)
+        
         sc = ax.scatter(
-            x_disp.loc[valid_ctf],
-            y_disp.loc[valid_ctf],
-            c=ctf_vals.loc[valid_ctf],
+            xv[mask],
+            yv[mask],
+            c=cv[mask],
             cmap=cmap,
             vmin=ctf_vmin,
             vmax=ctf_vmax,
-            s=point_size,
-            alpha=0.9,
+            s=scatter_size,
+            alpha=1,
             linewidths=0,
             edgecolors="none",
             zorder=2,
@@ -1624,21 +2026,20 @@ def render_location_ctf_image(
             x_disp,
             y_disp,
             color="0.55",
-            s=point_size,
+            s=scatter_size,
             alpha=0.8,
             linewidths=0,
             edgecolors="none",
             zorder=2,
         )
 
-
-    if (~valid_ctf).any():
+    if (~mask).any():
         ax.scatter(
-            x_disp.loc[~valid_ctf],
-            y_disp.loc[~valid_ctf],
+            xv[~mask],
+            yv[~mask],
             color="0.78",
-            s=max(0.4, point_size * 0.9),
-            alpha=0.6,
+            s=max(min_point_diameter_pt ** 2, scatter_size * 0.9),
+            alpha=0.8,
             linewidths=0,
             edgecolors="none",
             zorder=1,
@@ -1646,11 +2047,11 @@ def render_location_ctf_image(
 
     ax.set_xlabel(f"X ({unit_label})" if unit_label else "X")
     ax.set_ylabel(f"Y ({unit_label})" if unit_label else "Y")
-    ax.set_aspect("equal", adjustable="box")
     ax.grid(False)
 
     fig.tight_layout()
     return _fig_to_pil(fig)
+
 
 # ----------------------------
 # public entry point
@@ -1664,9 +2065,14 @@ def build_acquisition_location_image(
     mode: Optional[str] = None,
     ctf_vmin: Optional[float] = None,
     ctf_vmax: Optional[float] = None,
-    point_size: float = 0.8,
+    point_size: Optional[float] = None,
     auto_percentiles: Tuple[float, float] = (10.0, 90.0),
     rotate_epu_ccw: bool = True,
+    min_axis_range_um: Optional[float] = 300.0,
+    auto_point_size: bool = True,
+    point_diameter_um: float = 2.0,
+    min_point_diameter_pt: float = 0.5,
+    max_point_diameter_pt: float = 6.0,
 ) -> Tuple[Optional[Image.Image], Dict[str, object]]:
     info = {
         "mode": None,
@@ -1714,6 +2120,11 @@ def build_acquisition_location_image(
             point_size=point_size,
             auto_percentiles=auto_percentiles,
             rotate_epu_ccw=rotate_epu_ccw,
+            min_axis_range_um=min_axis_range_um,
+            auto_point_size=auto_point_size,
+            point_diameter_um=point_diameter_um,
+            min_point_diameter_pt=min_point_diameter_pt,
+            max_point_diameter_pt=max_point_diameter_pt,
         )
 
 
@@ -1724,5 +2135,146 @@ def build_acquisition_location_image(
         info["exception"] = repr(e)
         info["traceback"] = traceback.format_exc()
         return None, info
+
+def build_acquisition_scalar_image(
+    project_dir: str,
+    session_name: str,
+    parsed: List[dict],
+    values_by_uid: Optional[Dict[int, float]] = None,
+    values_by_key: Optional[Dict[str, float]] = None,
+    mode: Optional[str] = None,
+    value_col: str = "scalar_value",
+    value_label: str = "Value",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    point_size: Optional[float] = None,
+    auto_percentiles: Tuple[float, float] = (10.0, 90.0),
+    rotate_epu_ccw: bool = True,
+    min_axis_range_um: Optional[float] = 300.0,
+    auto_point_size: bool = True,
+    point_diameter_um: float = 2.0,
+    min_point_diameter_pt: float = 0.5,
+    max_point_diameter_pt: float = 6.0,
+) -> Tuple[Optional[Image.Image], Dict[str, object]]:
+    info = {
+        "mode": None,
+        "checked_exposures": 0,
+        "checked_movies": 0,
+        "xml_hits": 0,
+        "mdoc_hits": 0,
+        "n_points": 0,
+        "n_nonzero": 0,
+        "value_total": 0.0,
+        "matched_by_uid": 0,
+        "matched_by_key": 0,
+        "fail_counts": {},
+        "examples": [],
+    }
+
+
+    try:
+        df, detected_mode, build_info = build_location_dataframe(
+            project_dir=project_dir,
+            session_name=session_name,
+            parsed=parsed,
+            mode=mode,
+        )
+
+
+        info.update(build_info or {})
+        info["mode"] = detected_mode
+        info["n_points"] = 0 if df is None else int(len(df))
+
+
+        if df is None or detected_mode not in ("epu", "serialem"):
+            return None, info
+
+
+        uid_map = {}
+        for k, v in (values_by_uid or {}).items():
+            try:
+                uid_map[int(k)] = float(v)
+            except Exception:
+                pass
+
+        key_map = {}
+        for k, v in (values_by_key or {}).items():
+            nk = normalize_acquisition_key(k)
+            if not nk:
+                continue
+            try:
+                key_map[nk] = float(v)
+            except Exception:
+                pass
+
+        values = []
+        matched_by_uid = 0
+        matched_by_key = 0
+
+
+        for row in df.itertuples(index=False):
+            val = None
+
+
+            uid = getattr(row, "uid", None)
+            try:
+                uid_int = int(uid)
+            except Exception:
+                uid_int = None
+
+
+            if uid_int is not None and uid_int in uid_map:
+                val = uid_map[uid_int]
+                matched_by_uid += 1
+            else:
+                for source in (getattr(row, "movie_path", None), getattr(row, "sidecar_path", None)):
+                    key = normalize_acquisition_key(source)
+                    if key and key in key_map:
+                        val = key_map[key]
+                        matched_by_key += 1
+                        break
+
+
+            if val is None or not np.isfinite(val):
+                val = 0.0
+
+
+            values.append(float(val))
+
+
+        df = df.copy()
+        df[value_col] = values
+        info["matched_by_uid"] = matched_by_uid
+        info["matched_by_key"] = matched_by_key
+        info["n_nonzero"] = int((df[value_col] > 0).sum())
+        info["value_total"] = float(df[value_col].sum())
+
+
+        img = render_location_scalar_image(
+            df=df,
+            mode=detected_mode,
+            session_name=session_name,
+            value_col=value_col,
+            value_label=value_label,
+            vmin=vmin,
+            vmax=vmax,
+            point_size=point_size,
+            auto_percentiles=auto_percentiles,
+            rotate_epu_ccw=rotate_epu_ccw,
+            min_axis_range_um=min_axis_range_um,
+            auto_point_size=auto_point_size,
+            point_diameter_um=point_diameter_um,
+            min_point_diameter_pt=min_point_diameter_pt,
+            max_point_diameter_pt=max_point_diameter_pt,
+        )
+        return img, info
+
+
+    except Exception as e:
+        info["exception"] = repr(e)
+        info["traceback"] = traceback.format_exc()
+        return None, info
+
+
 
 

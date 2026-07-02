@@ -39,11 +39,17 @@ import re
 import sys
 import argparse
 import numpy as np
+import shutil
+import subprocess
+import time
 
 from pathlib import Path
 from typing import Optional
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas as rl_canvas
+from reportlab import rl_config
+rl_config.useA85 = 0
+
 from PIL import Image, ImageDraw, ImageFont
 
 _IMPORT_ERRORS = []
@@ -52,6 +58,7 @@ try:
     from cryosparc_live_report.io import (
         read_json,
         load_exposures_bson,
+        iter_exposures_bson,
         find_live_workspace,
         find_latest_classavg_mrc,
         fmt_num,
@@ -62,8 +69,10 @@ except Exception as e:
 
 try:
     from cryosparc_live_report.stats import (
-        parse_exposure,
+        parse_exposure_light,
+        enrich_exposure_paths,
         assign_exposure_numbers,
+        assign_elapsed_minutes,
         select_accepted_ctf_tertiles,
         select_rejected_random,
         build_summary_sections,
@@ -85,7 +94,7 @@ except Exception as e:
     _IMPORT_ERRORS.append(f"cryosparc_live_report.images import failed: {e}")
 
 try:
-    from cryosparc_live_report.plots import build_scatterplots
+    from cryosparc_live_report.plots import build_scatterplot_pages
 except Exception as e:
     _IMPORT_ERRORS.append(f"cryosparc_live_report.plots import failed: {e}")
 
@@ -111,7 +120,11 @@ except Exception:
     generate_initial_model_pngs = None
 
 try:
-    from cryosparc_live_report.acquisition_locations import build_acquisition_location_image
+    from cryosparc_live_report.acquisition_locations import (
+        build_acquisition_location_image,
+        build_acquisition_scalar_image,
+        normalize_acquisition_key,
+    )
 except Exception as e:
     _IMPORT_ERRORS.append(f"cryosparc_live_report.acquisition_locations import failed: {e}")
 
@@ -173,6 +186,10 @@ def _finite_positive_float(v):
     if not np.isfinite(x) or x <= 0:
         return None
     return x
+
+def chunked(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
 
 def get_workspace_particle_diameter_A(ws: dict):
     params = ws.get("params", {}) or {}
@@ -550,6 +567,170 @@ def _fmt_int(v):
         return f"{int(v):,}"
     except Exception:
         return str(v)
+        
+def _decode_text_maybe(v):
+    if isinstance(v, (bytes, np.bytes_)):
+        return v.decode("utf-8", errors="ignore")
+    if v is None:
+        return None
+    return str(v)
+
+
+
+
+def _find_first_existing_file(base_dir: Path, names):
+    for name in names:
+        p = base_dir / name
+        if p.is_file():
+            return p
+    return None
+
+
+
+
+def _load_cs_array(cs_path: Path):
+    return np.load(str(cs_path), mmap_mode="r", allow_pickle=False)
+
+
+
+
+def choose_particle_analysis_job(ws: dict, refine_job_uid: str = None):
+    """
+    Choose the job to drive the particle-analysis page.
+
+
+    Returns:
+        ({'job_uid': 'JXX', 'job_type': 'refine'|'select2D'}, None)
+    or:
+        (None, 'reason')
+    """
+    class2d_job_uid = str(ws.get("phase2_class2D_job") or "").strip() or None
+    abinit_job_uid = str(ws.get("phase2_abinit_job") or "").strip() or None
+    workspace_refine_job_uid = str(ws.get("phase2_refine_job") or "").strip() or None
+    select2d_job_uid = str(ws.get("phase2_select2D_job") or "").strip() or None
+
+
+    active_refine_job_uid = refine_job_uid or workspace_refine_job_uid
+
+
+    class2d_info = ws.get("phase2_class2D_info") or []
+    n_selected_classes = sum(1 for row in class2d_info if bool(row.get("selected")))
+
+
+    if not any((class2d_job_uid, abinit_job_uid, active_refine_job_uid)):
+        return None, "No 2D, initial model, or refinement jobs found."
+
+
+    if active_refine_job_uid:
+        return {
+            "job_uid": active_refine_job_uid,
+            "job_type": "refine",
+        }, None
+
+
+    if n_selected_classes == 0:
+        return None, "No refinement job and no selected 2D classes."
+
+
+    if class2d_job_uid and select2d_job_uid:
+        return {
+            "job_uid": select2d_job_uid,
+            "job_type": "select2D",
+        }, None
+
+
+    return None, "No refinement job and no associated phase2_select2D_job found."
+
+
+
+
+def summarize_particle_counts_from_cs(cs_arr):
+    """
+    Return:
+        {
+            'total_particles': int,
+            'counts_by_uid': {micrograph_uid: count, ...},
+            'counts_by_key': {normalized_key: count, ...},
+        }
+    """
+    dtype_names = set(cs_arr.dtype.names or [])
+    total_particles = int(len(cs_arr))
+
+
+    counts_by_uid = {}
+    counts_by_key = {}
+
+
+    if "location/micrograph_uid" in dtype_names:
+        vals = np.asarray(cs_arr["location/micrograph_uid"])
+        if vals.size > 0:
+            uniq, counts = np.unique(vals, return_counts=True)
+            counts_by_uid = {int(u): int(c) for u, c in zip(uniq, counts)}
+
+
+    path_field = None
+    for candidate in ("location/micrograph_path", "blob/path"):
+        if candidate in dtype_names:
+            path_field = candidate
+            break
+
+
+    if path_field is not None:
+        tmp = {}
+        for raw_path in cs_arr[path_field]:
+            key = normalize_acquisition_key(_decode_text_maybe(raw_path))
+            if not key:
+                continue
+            tmp[key] = tmp.get(key, 0) + 1
+        counts_by_key = tmp
+
+
+    return {
+        "total_particles": total_particles,
+        "counts_by_uid": counts_by_uid,
+        "counts_by_key": counts_by_key,
+    }
+
+
+
+
+def load_particle_counts_for_job(project_dir: str, job_uid: str, job_type: str):
+    job_dir = Path(project_dir) / job_uid
+    if not job_dir.is_dir():
+        raise FileNotFoundError(f"Particle-analysis job directory not found: {job_dir}")
+
+
+    if job_type == "refine":
+        cs_path = _find_first_existing_file(job_dir, [
+            f"{job_uid}_passthrough_particles.cs",
+            "passthrough_particles.cs",
+            f"{job_uid}_particles.cs",
+            "particles.cs",
+        ])
+    elif job_type == "select2D":
+        cs_path = _find_first_existing_file(job_dir, [
+            f"{job_uid}_passthrough_particles_selected.cs",
+            "passthrough_particles_selected.cs",
+            f"{job_uid}_particles_selected.cs",
+            "particles_selected.cs",
+            f"{job_uid}_selected_particles.cs",
+            "selected_particles.cs",
+        ])
+    else:
+        raise ValueError(f"Unsupported particle-analysis job type: {job_type}")
+
+
+    if cs_path is None:
+        raise FileNotFoundError(f"Could not find particle file for {job_uid} ({job_type})")
+
+
+    cs_arr = _load_cs_array(cs_path)
+    summary = summarize_particle_counts_from_cs(cs_arr)
+    summary["cs_path"] = str(cs_path)
+    summary["job_uid"] = job_uid
+    summary["job_type"] = job_type
+    return summary
+
 
 def get_total_particles_classified_2d(ws: dict) -> int:
     """
@@ -761,6 +942,145 @@ def build_refinement_note(
 
     return " ".join(parts)
 
+def optimize_pdf_with_ghostscript(
+    pdf_path,
+    dpi=600,
+    jpeg_quality=None,
+    replace_original=False,
+    suffix="_optimized",
+):
+    """
+    Optimize a PDF using Ghostscript.
+
+
+    Parameters
+    ----------
+    pdf_path : str or Path
+        Path to the input PDF.
+    dpi : int
+        Target resolution for color/grayscale images.
+    jpeg_quality : int or None
+        If set (e.g. 85), forces JPEG recompression for color/grayscale images.
+        If None, Ghostscript chooses compression automatically.
+    replace_original : bool
+        If True, replaces the original PDF with the optimized one.
+    suffix : str
+        Suffix for the optimized PDF filename if replace_original is False.
+
+
+    Returns
+    -------
+    str
+        Path to the optimized PDF, or the original PDF if optimization failed.
+    """
+    pdf_path = Path(pdf_path)
+
+
+    if not pdf_path.is_file():
+        print(f"Ghostscript optimization skipped: file not found: {pdf_path}")
+        return str(pdf_path)
+
+
+    gs = shutil.which("gs")
+    if gs is None:
+        # Common Windows executable names
+        for candidate in ("gswin64c", "gswin32c"):
+            gs = shutil.which(candidate)
+            if gs:
+                break
+
+
+    if gs is None:
+        print("Ghostscript optimization skipped: Ghostscript executable not found.")
+        return str(pdf_path)
+
+
+    if replace_original:
+        out_path = pdf_path.with_name(pdf_path.stem + "_tmp_optimized.pdf")
+    else:
+        out_path = pdf_path.with_name(pdf_path.stem + suffix + pdf_path.suffix)
+
+
+    cmd = [
+        gs,
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.6",
+        "-dNOPAUSE",
+        "-dQUIET",
+        "-dBATCH",
+        "-dDetectDuplicateImages=true",
+        "-dCompressFonts=true",
+        "-dAutoRotatePages=/None",
+        "-dDownsampleColorImages=true",
+        "-dColorImageDownsampleType=/Bicubic",
+        f"-dColorImageResolution={int(dpi)}",
+        "-dDownsampleGrayImages=true",
+        "-dGrayImageDownsampleType=/Bicubic",
+        f"-dGrayImageResolution={int(dpi)}",
+        "-dDownsampleMonoImages=true",
+        "-dMonoImageDownsampleType=/Subsample",
+        "-dMonoImageResolution=600",
+    ]
+
+
+    if jpeg_quality is not None:
+        cmd.extend([
+            "-dAutoFilterColorImages=false",
+            "-dColorImageFilter=/DCTEncode",
+            "-dAutoFilterGrayImages=false",
+            "-dGrayImageFilter=/DCTEncode",
+            f"-dJPEGQ={int(jpeg_quality)}",
+        ])
+
+
+    cmd.extend([
+        f"-sOutputFile={out_path}",
+        str(pdf_path),
+    ])
+
+
+    try:
+        orig_size = pdf_path.stat().st_size
+        subprocess.run(cmd, check=True)
+        new_size = out_path.stat().st_size if out_path.exists() else None
+
+
+        if replace_original and out_path.exists():
+            os.replace(out_path, pdf_path)
+            final_size = pdf_path.stat().st_size
+#            print(
+#                f"Optimized PDF written over original: {pdf_path} "
+#                f"({orig_size / 1024 / 1024:.1f} MB -> {final_size / 1024 / 1024:.1f} MB)"
+#            )
+            return str(pdf_path)
+
+
+        if new_size is not None:
+            print(
+                f"Optimized PDF written: {out_path} "
+                f"({orig_size / 1024 / 1024:.1f} MB -> {new_size / 1024 / 1024:.1f} MB)"
+            )
+            return str(out_path)
+
+
+    except subprocess.CalledProcessError as e:
+        print(f"Ghostscript optimization failed: {e}")
+    except Exception as e:
+        print(f"Ghostscript optimization failed: {e}")
+
+
+    # Clean up temp file if needed
+    try:
+        if replace_original and out_path.exists():
+            out_path.unlink()
+    except Exception:
+        pass
+
+
+    return str(pdf_path)
+
+
+
 
 def build_report(
     project_dir: str, 
@@ -769,6 +1089,8 @@ def build_report(
     epu_session_dir: str = None,
     atlas_root: str = None,    
 ) -> int:
+    
+    print("Beginning analysis (this may take a few minutes)...")
     
     print_preflight_errors_and_exit()
 
@@ -799,29 +1121,17 @@ def build_report(
     bin_size_pix = int(params.get("bin_size_pix", 180) or 180)
     common_particle_diameter_A = get_workspace_particle_diameter_A(ws)
 
-    try:
-        exposures = load_exposures_bson(exposures_bson)
-    except Exception as e:
-        print(f"Error: failed to read exposures.bson: {e}")
-        print("Hint: install/use pymongo so bson.decode_file_iter is available.")
-        return 2
 
     try:
-        parsed = [parse_exposure(project_dir, session_name, exp, bin_size_pix) for exp in exposures]
+        parsed = [
+            parse_exposure_light(project_dir, session_name, exp)
+            for exp in iter_exposures_bson(exposures_bson)
+        ]
         parsed = assign_exposure_numbers(parsed)
-
-        start_times = [e.get("start_dt") for e in parsed if e.get("start_dt") is not None]
-        if start_times:
-            t0 = min(start_times)
-            for e in parsed:
-                dt = e.get("start_dt")
-                if dt is not None:
-                    e["elapsed_minutes"] = (dt - t0).total_seconds() / 60.0
-                else:
-                    e["elapsed_minutes"] = None
+        parsed = assign_elapsed_minutes(parsed)
 
     except Exception as e:
-        print(f"Error: failed to parse exposure metadata: {e}")
+        print(f"Error: failed to load or parse exposure metadata: {e}")
         return 2
 
     try:
@@ -831,7 +1141,7 @@ def build_report(
             print("Warning: workspace does not define phase2_class2D_job; 2D class-average pages may be omitted.")
 
         elif not os.path.isdir(os.path.join(project_dir, class_job_uid)):
-            print(f"Warning: workspace 2D class job directory not found: {class_job_uid}")
+#            print(f"Warning: workspace 2D class job directory not found: {class_job_uid}")
             class_job_uid = None
 
     except Exception as e:
@@ -850,6 +1160,7 @@ def build_report(
     SCATTERPLOT_STYLE = REPORT_STYLE["scatterplots"]
     CLASSAVG_STYLE = REPORT_STYLE["classavg"]
     REFINEMENT_STYLE = REPORT_STYLE["refinement"]
+
 
     classavg_render_kwargs = dict(CLASSAVG_STYLE["render"])
 
@@ -885,8 +1196,19 @@ def build_report(
     accepted_tertiles = select_accepted_ctf_tertiles(parsed, n_each=4)
     rejected_sample = select_rejected_random(parsed, n=4, seed_str=f"{project_dir}:{session_name}:rejected")
 
+    for label in ("best", "middle", "worst"):
+        accepted_tertiles[label] = [
+            enrich_exposure_paths(project_dir, session_name, exp, bin_size_pix)
+            for exp in accepted_tertiles[label]
+        ]
+
+    rejected_sample = [
+        enrich_exposure_paths(project_dir, session_name, exp, bin_size_pix)
+        for exp in rejected_sample
+    ]
+
     try:
-        scatterplots = build_scatterplots(
+        scatterplot_pages = build_scatterplot_pages(
             parsed,
             ws,
             text_theme=REPORT_TEXT_THEME,
@@ -894,7 +1216,8 @@ def build_report(
         )
     except Exception as e:
         print(f"Warning: failed to render scatterplots: {e}")
-        scatterplots = []
+        scatterplot_pages = []
+
 
     acquisition_loc_img = None
     acquisition_loc_info = {}
@@ -903,7 +1226,10 @@ def build_report(
             project_dir=project_dir,
             session_name=session_name,
             parsed=parsed,
-            point_size=0.8,
+            auto_point_size=True,
+            point_diameter_um=3,
+            min_point_diameter_pt=0.5,
+            max_point_diameter_pt=6.0,
             rotate_epu_ccw=True,
         )
 
@@ -911,6 +1237,47 @@ def build_report(
 
     except Exception as e:
         print(f"Warning: failed to render acquisition-location page: {e}")
+
+
+    particle_analysis_img = None
+    particle_analysis_info = {}
+    particle_analysis_job_uid = None
+    particle_analysis_skip_reason = None
+    try:
+        particle_job_spec, particle_analysis_skip_reason = choose_particle_analysis_job(
+            ws,
+            refine_job_uid=refine_job_uid,
+        )
+
+
+        if particle_job_spec is not None:
+            particle_counts = load_particle_counts_for_job(
+                project_dir=project_dir,
+                job_uid=particle_job_spec["job_uid"],
+                job_type=particle_job_spec["job_type"],
+            )
+
+
+            particle_analysis_job_uid = particle_job_spec["job_uid"]
+
+            particle_analysis_img, particle_analysis_info = build_acquisition_scalar_image(
+                project_dir=project_dir,
+                session_name=session_name,
+                parsed=parsed,
+                values_by_uid=particle_counts["counts_by_uid"],
+                values_by_key=particle_counts["counts_by_key"],
+                value_label="Selected particles per micrograph",
+                auto_percentiles=(10.0, 90.0),
+                auto_point_size=True,
+                point_diameter_um=3,
+                min_point_diameter_pt=0.5,
+                max_point_diameter_pt=6.0,
+                rotate_epu_ccw=True,
+            )
+            particle_analysis_info["total_particles"] = int(particle_counts["total_particles"])
+    except Exception as e:
+        print(f"Warning: failed to render particle-analysis page: {e}")
+
 
     accepted_heading_map = {
         "best": "Accepted Micrographs: Best-Third CTF Fit",
@@ -959,6 +1326,7 @@ def build_report(
             )
         except Exception as e:
             print(f"Warning: failed rejected panel for exposure {exp.get('uid')}: {e}")
+
 
     sections = build_summary_sections(project, ws, parsed, class_job_uid, project_dir=project_dir)
     rows = flatten_summary_sections(sections)
@@ -1017,6 +1385,7 @@ def build_report(
             except Exception as e:
                 print(f"Warning: failed to generate initial-model PNGs for {abinit_job_uid}: {e}")
 
+
     workspace_refine_job_uid = str(ws.get("phase2_refine_job") or "").strip() or None
     if not refine_job_uid:
         refine_job_uid = workspace_refine_job_uid
@@ -1058,15 +1427,16 @@ def build_report(
                 print(f"Warning: failed to generate refinement PNGs for {refine_job_uid}: {e}")
                 import traceback
                 traceback.print_exc()
-    else:
-        print("No refine_job_uid found; refinement section will be skipped.")
+#    else:
+#        print("No refine_job_uid found; refinement section will be skipped.")
 
     project_folder = os.path.basename(project_dir.rstrip(os.sep))
     pdf_name = f"Live_Imaging_Summary_{project_folder}_{session_name}.pdf"
     pdf_path = os.path.join(project_dir, pdf_name)
 
+
     try:
-        c = rl_canvas.Canvas(pdf_path, pagesize=letter)
+        c = rl_canvas.Canvas(pdf_path, pagesize=letter, pageCompression=1)
         width, height = letter
         margin = 36
         page_num = 1
@@ -1076,14 +1446,27 @@ def build_report(
             page_num_start=page_num,
         )
 
-        if scatterplots:
+        if scatterplot_pages:
             scatter_note = (
-                "Threshold lines are included only when min/max limits are present in workspace attributes. X-axis is exposure number for all plots."
+                "Threshold lines are included only when min/max limits are present in workspace attributes. Any conditions with min/max limits are shown, in addition to a selection of most-informative plots. X-axis is exposure number for all plots."
             )
-            page_num = draw_five_plot_page(
-                c, page_num, width, height, margin,
-                "Session Scatterplots", scatterplots, scatter_note
-            )
+
+            max_plots_per_page = 7
+
+            for page_idx, (heading, plots) in enumerate(scatterplot_pages):
+                for chunk_idx, plot_chunk in enumerate(chunked(plots, max_plots_per_page)):
+                    page_heading = heading if chunk_idx == 0 else f"{heading} ({chunk_idx + 1})"
+
+                    page_num = draw_five_plot_page(
+                        c,
+                        page_num,
+                        width,
+                        height,
+                        margin,
+                        page_heading,
+                        plot_chunk,
+                        scatter_note if (page_idx == 0 and chunk_idx == 0) else None,
+                    )
 
         if acquisition_loc_img is not None:
             mode = acquisition_loc_info.get("mode")
@@ -1104,14 +1487,32 @@ def build_report(
                 note=acquisition_note,
             )
         else:
-            print("Unable to render location vs CTF plot (perhaps the raw data have moved or been deleted, or no metadata files?)")
-#            print("acquisition_loc_info =", acquisition_loc_info)
+            print("Unable to render location plots (perhaps the raw data have moved or been deleted, or no metadata files?)")
+  #          print("acquisition_loc_info =", acquisition_loc_info)
+
+        if particle_analysis_img is not None and particle_analysis_job_uid:
+            particle_note = f"Total selected particles used in analysis: {_fmt_int(particle_analysis_info.get('total_particles', 0))}\nMicrographs with zero selected particles are colored gray"
+            page_num = draw_single_image_page(
+                c,
+                page_num,
+                width,
+                height,
+                margin,
+                f"Physical Location vs Selected Particles per Micrograph ({particle_analysis_job_uid})",
+                particle_analysis_img,
+                note=particle_note,
+            )
+        elif particle_analysis_skip_reason:
+            print(f"Skipping particle-analysis page: {particle_analysis_skip_reason}")
+        elif acquisition_loc_img is not None:
+            print("Skipped location vs particle plot (likely no appropriate jobs identified)")
+
 
         if accepted_panels_by_tertile:
             accepted_note = (
-                "Representative accepted micrographs are chosen from accepted exposures and split into best, middle, and worst thirds by CTF fit. "
+                "Representative accepted micrographs are randomly chosen from accepted exposures after splitting into best, middle, and worst thirds by CTF fit. "
                 "Pick overlays and extracted-particle examples use the picker active for each exposure (blob or template). "
-                "Particles are Butterworth filtered (25 Å) for ease of viewing; color is inverted (lighter particles on darker background)"
+                "Particles are Butterworth filtered (25 Å) for ease of viewing; color is inverted (lighter particles on darker background)."
             )
             accepted_note_used = False
 
@@ -1144,6 +1545,11 @@ def build_report(
                 note=rejected_note
             )
 
+        if classavg_imgs:
+            print(f"2D class average job: {class_job_uid}")
+        else:
+            print(f"No 2D class average job detected; segment skipped")   
+
         for i, classavg_img in enumerate(classavg_imgs, start=1):
             heading = f"2D Class Averages ({class_job_uid})"
             if len(classavg_imgs) > 1:
@@ -1162,6 +1568,7 @@ def build_report(
             )
 
         if initial_model_panels:
+            print(f"Initial model job: {abinit_job_uid}")
             initial_model_note = build_initial_model_note(ws, abinit_job_uid, panel_info_list=initial_model_panel_info)
 
             page_num = draw_initial_model_summary_pages(
@@ -1174,8 +1581,11 @@ def build_report(
                 initial_model_panels,
                 note=initial_model_note,
             )
+        else:
+            print(f"No initial model job detected; segment skipped")
 
         if refinement_panel_map:
+            print(f"Refinement job: {refine_job_uid}")
             refine_note = build_refinement_note(
                 ws,
                 refine_job_uid,
@@ -1195,18 +1605,18 @@ def build_report(
                 refinement_panel_map,
                 note=refine_note,
             )
+        else:
+            print(f"No refinement job detected; segment skipped")
 
         c.save()
+
+        optimize_pdf_with_ghostscript(pdf_path, dpi=600, replace_original=True)
+        print(f"Wrote: {pdf_name}")
 
     except Exception as e:
         print(f"Error: failed while writing PDF: {e}")
         return 2
 
-    print(f"Wrote: {pdf_name}")
-    if classavg_mrc:
-        print(f"Class-average job: {class_job_uid}")
-    if refinement_panel_map:
-        print(f"Refinement job: {refine_job_uid}")
     return 0
 
 
@@ -1222,6 +1632,7 @@ def main():
         session_name=args.session,
         refine_job_uid=args.refine_job,
     )
+    
     sys.exit(rc)
 
 

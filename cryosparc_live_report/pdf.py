@@ -5,9 +5,11 @@ from typing import List, Tuple, Optional
 
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import Paragraph, Table, TableStyle, Spacer, Frame
+from reportlab.platypus import Frame, Paragraph, Spacer, Table, TableStyle, KeepInFrame
 from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader, simpleSplit
+
+from PIL import Image, ImageChops
 
 try:
     from epu.report_style import (
@@ -34,6 +36,72 @@ except Exception:
 
     def draw_frame_box(c, x, y_top, w, h):
         c.rect(x, y_top - h, w, h, stroke=1, fill=0)
+        
+def _prepare_pdf_image(pil_img, draw_w_pt, draw_h_pt, max_dpi=450):
+    """
+    Prepare a PIL image for compact PDF embedding.
+
+
+    - Flattens alpha onto white
+    - Converts RGB->L if the image is actually grayscale
+    - Downsamples to the maximum useful pixel size for the drawn size
+
+
+    draw_w_pt / draw_h_pt are the final on-page dimensions in points.
+    """
+    if pil_img is None:
+        return None
+
+
+    img = pil_img
+
+
+    # Flatten transparency onto white so we do not need mask="auto"
+    if img.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", img.size, "white")
+        alpha = img.getchannel("A") if "A" in img.getbands() else None
+        bg.paste(img.convert("RGB"), mask=alpha)
+        img = bg
+    elif img.mode == "P":
+        img = img.convert("RGB")
+    elif img.mode not in ("1", "L", "RGB"):
+        img = img.convert("RGB")
+
+
+    # If image is really grayscale, store as L instead of RGB
+    if img.mode == "RGB":
+        try:
+            r, g, b = img.split()
+            if (
+                ImageChops.difference(r, g).getbbox() is None and
+                ImageChops.difference(r, b).getbbox() is None
+            ):
+                img = img.convert("L")
+        except Exception:
+            pass
+
+
+    # Compute maximum useful raster size for the actual drawn size
+    target_px_w = max(1, int(round(draw_w_pt / 72.0 * max_dpi)))
+    target_px_h = max(1, int(round(draw_h_pt / 72.0 * max_dpi)))
+
+
+    iw, ih = img.size
+    scale = min(target_px_w / float(iw), target_px_h / float(ih), 1.0)
+
+
+    if scale < 1.0:
+        new_size = (
+            max(1, int(round(iw * scale))),
+            max(1, int(round(ih * scale))),
+        )
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+
+    return img
+
+
+
 
 def render_framed_pil(c, pil_img, x_left, y_top, max_w, max_h, frame_pad=4.0):
     iw, ih = pil_img.size
@@ -43,21 +111,26 @@ def render_framed_pil(c, pil_img, x_left, y_top, max_w, max_h, frame_pad=4.0):
     draw_frame_box(c, x_left, y_top, max_w, total_h)
     x_img = x_left + frame_pad + (max_w - 2 * frame_pad - dw) / 2.0
     y_img = y_top - frame_pad - dh
-    c.drawImage(ImageReader(pil_img), x_img, y_img, width=dw, height=dh, preserveAspectRatio=True, mask="auto")
+
+
+    prepped = _prepare_pdf_image(pil_img, dw, dh, max_dpi=450)
+    c.drawImage(ImageReader(prepped), x_img, y_img, width=dw, height=dh, preserveAspectRatio=True)
+
+
     return total_h
 
 def render_framed_pil_in_box(c, pil_img, x_left, y_top, box_w, box_h, frame_pad=4.0):
-    """
-    Draw a PIL image centered inside a fixed-size framed box.
-    """
     draw_frame_box(c, x_left, y_top, box_w, box_h)
+
 
     if pil_img is None:
         return box_h
 
+
     iw, ih = pil_img.size
     if iw <= 0 or ih <= 0:
         return box_h
+
 
     scale = min(
         (box_w - 2 * frame_pad) / float(iw),
@@ -65,20 +138,23 @@ def render_framed_pil_in_box(c, pil_img, x_left, y_top, box_w, box_h, frame_pad=
     )
     scale = max(scale, 0.0)
 
+
     dw = iw * scale
     dh = ih * scale
+
 
     x_img = x_left + (box_w - dw) / 2.0
     y_img = y_top - box_h + (box_h - dh) / 2.0
 
+
+    prepped = _prepare_pdf_image(pil_img, dw, dh, max_dpi=450)
     c.drawImage(
-        ImageReader(pil_img),
+        ImageReader(prepped),
         x_img,
         y_img,
         width=dw,
         height=dh,
         preserveAspectRatio=True,
-        mask="auto",
     )
     return box_h
 
@@ -209,15 +285,14 @@ def draw_titled_panel_in_box(
     x_img = img_x0 + (avail_w - dw) / 2.0
     y_img = img_y_top - dh - (avail_h - dh) / 2.0
 
-
+    prepped = _prepare_pdf_image(pil_img, dw, dh, max_dpi=450)
     c.drawImage(
-        ImageReader(pil_img),
+        ImageReader(prepped),
         x_img,
         y_img,
         width=dw,
         height=dh,
         preserveAspectRatio=True,
-        mask="auto",
     )
 
 
@@ -226,6 +301,7 @@ def draw_titled_panel_in_box(
 def add_summary_pages(c, width, height, margin, project_folder_name, sections, page_num_start=1):
     page_num = page_num_start
     styles = getSampleStyleSheet()
+
 
     body_style = ParagraphStyle(
         "Body",
@@ -251,18 +327,21 @@ def add_summary_pages(c, width, height, margin, project_folder_name, sections, p
         spaceAfter=4,
     )
     key_style = ParagraphStyle("Key", parent=body_style, fontName=RL_FONT_FAMILY_BOLD)
-    notes_title_style = ParagraphStyle("NotesTitle", parent=body_style, fontName=RL_FONT_FAMILY_BOLD, spaceAfter=6)
-    bullet_style = ParagraphStyle("Bullet", parent=body_style, leftIndent=12, bulletIndent=0)
 
-    story = []
-    story.append(Paragraph(f"CryoSPARC Live Summary: {project_folder_name}", title_style))
-    story.append(Spacer(1, 0.08 * inch))
+
+    content = []
+    content.append(Paragraph(f"CryoSPARC Live Summary: {project_folder_name}", title_style))
+    content.append(Spacer(1, 0.08 * inch))
+
 
     for sec in sections:
-        story.append(Paragraph(sec["title"], section_style))
+        content.append(Paragraph(sec["title"], section_style))
+
+
         if sec.get("summary_html"):
-            story.append(Paragraph(sec["summary_html"], body_style))
-            story.append(Spacer(1, 0.06 * inch))
+            content.append(Paragraph(sec["summary_html"], body_style))
+            content.append(Spacer(1, 0.06 * inch))
+
 
         table_data = [
             [Paragraph(str(k), key_style), Paragraph(str(v), body_style)]
@@ -277,22 +356,33 @@ def add_summary_pages(c, width, height, margin, project_folder_name, sections, p
                 ("TOPPADDING", (0, 0), (-1, -1), 1),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
             ]))
-            story.append(table)
-            story.append(Spacer(1, 0.10 * inch))
+            content.append(table)
+            content.append(Spacer(1, 0.10 * inch))
 
-    while story:
-        frame = Frame(margin, margin, width - 2 * margin, height - 2 * margin, showBoundary=0)
-        remaining = list(story)
-        frame.addFromList(remaining, c)
-        draw_page_number(c, page_num, width, margin)
-        c.showPage()
-        page_num += 1
-        if len(remaining) == len(story):
-            # safety: prevent infinite loop if one element is too large
-            break
-        story = remaining
 
-    return page_num
+    avail_w = width - 2 * margin
+    avail_h = height - 2 * margin
+
+
+    fitted = KeepInFrame(
+        avail_w,
+        avail_h,
+        content,
+        mode="shrink",   # only shrinks if needed
+        hAlign="LEFT",
+        vAlign="TOP",
+    )
+
+
+    frame = Frame(margin, margin, avail_w, avail_h, showBoundary=0)
+    story = [fitted]
+    frame.addFromList(story, c)
+
+
+    draw_page_number(c, page_num, width, margin)
+    c.showPage()
+    return page_num + 1
+
 
 def draw_single_image_page(c, page_num, width, height, margin, heading, pil_img, note=None):
     y = height - margin

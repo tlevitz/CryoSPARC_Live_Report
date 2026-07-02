@@ -113,6 +113,16 @@ def load_exposures_bson(path: str) -> List[Dict[str, Any]]:
                 exposures.extend(doc["exposures"])
     return exposures
 
+def iter_exposures_bson(path: str):
+    if not os.path.isfile(path):
+        return
+    if decode_file_iter is None:
+        raise RuntimeError("bson.decode_file_iter unavailable; use pymongo bson")
+    with open(path, "rb") as f:
+        for doc in decode_file_iter(f):
+            exps = doc.get("exposures")
+            if isinstance(exps, list):
+                yield from exps
 
 def find_live_workspace(workspaces: List[dict], session_name: str) -> dict:
     live = [w for w in workspaces if w.get("workspace_type") == "live"]

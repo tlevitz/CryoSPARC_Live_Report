@@ -5,6 +5,9 @@ import io
 import math
 from io import BytesIO
 from typing import List, Optional, Tuple, Callable, Union
+import csv
+import json
+from pathlib import Path
 
 AlphaLike = Union[int, Callable[[object, int, int], int]]
 
@@ -19,6 +22,8 @@ from matplotlib.patches import Rectangle
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from scipy.ndimage import map_coordinates
 from skimage.filters import butterworth
+
+from functools import lru_cache
 
 try:
     from cryosparc.tools import Dataset
@@ -50,7 +55,7 @@ except Exception:
 
 A_TO_UM = 1e-4  # 1 Å = 1e-4 µm
 
-
+@lru_cache(maxsize=32)
 def load_font(size=16, bold=False):
     candidates = []
     if bold:
@@ -72,6 +77,103 @@ def load_font(size=16, bold=False):
             pass
     return ImageFont.load_default()
 
+class SimpleDataset:
+    def __init__(self, rows):
+        self._rows = rows
+        self._fields = list(rows[0].keys()) if rows else []
+
+
+    def __len__(self):
+        return len(self._rows)
+
+
+    def __getitem__(self, i):
+        return self._rows[i]
+
+
+    def fields(self):
+        return self._fields
+
+
+
+
+def _coerce_scalar(v):
+    if v is None:
+        return None
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, bytes):
+        try:
+            return v.decode("utf-8")
+        except Exception:
+            return v
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return s
+        try:
+            if any(c in s for c in ".eE"):
+                return float(s)
+            return int(s)
+        except Exception:
+            return s
+    return v
+
+
+
+
+def load_simple_dataset(path: str) -> SimpleDataset:
+    ext = Path(path).suffix.lower()
+
+
+    if ext in {".csv", ".tsv"}:
+        delim = "," if ext == ".csv" else "\t"
+        with open(path, "r", newline="") as f:
+            rows = [
+                {k: _coerce_scalar(v) for k, v in row.items()}
+                for row in csv.DictReader(f, delimiter=delim)
+            ]
+        return SimpleDataset(rows)
+
+
+    if ext == ".json":
+        with open(path, "r") as f:
+            obj = json.load(f)
+        if isinstance(obj, list):
+            rows = [{k: _coerce_scalar(v) for k, v in row.items()} for row in obj]
+            return SimpleDataset(rows)
+        raise ValueError(f"JSON must contain a list of rows: {path}")
+
+
+    # Best-effort fallback for NumPy structured arrays
+    try:
+        arr = np.load(path, allow_pickle=True)
+
+
+        if isinstance(arr, np.lib.npyio.NpzFile):
+            keys = list(arr.keys())
+            if not keys:
+                raise ValueError(f"No arrays in archive: {path}")
+            arr = arr[keys[0]]
+
+
+        arr = np.asarray(arr)
+
+
+        if arr.dtype.names is not None:
+            rows = []
+            names = list(arr.dtype.names)
+            for i in range(len(arr)):
+                rows.append({name: _coerce_scalar(arr[name][i]) for name in names})
+            return SimpleDataset(rows)
+    except Exception:
+        pass
+
+
+    raise ValueError(
+        f"Unsupported pick table format: {path}. "
+        f"Use CSV/TSV/JSON, or a NumPy structured array."
+    )
 
 def fit_within(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
     out = img.copy()
@@ -827,11 +929,11 @@ def overlay_blob_picks(
     line_w: int = 6,
 ) -> Image.Image:
     img = base_img.convert("RGBA")
-    if not pick_cs_path or Dataset is None:
+    if not pick_cs_path:
         return img.convert("RGB")
 
     try:
-        ds = Dataset.load(pick_cs_path)
+        ds = load_simple_dataset(pick_cs_path)
         n = len(ds)
         if n == 0:
             return img.convert("RGB")

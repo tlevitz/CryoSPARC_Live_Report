@@ -25,6 +25,60 @@ from .io import (
 )
 
 
+def _safe_float_or_none(x):
+    try:
+        x = float(x)
+        if np.isfinite(x):
+            return x
+    except Exception:
+        pass
+    return None
+
+
+
+
+def _safe_int_or_none(x):
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+
+
+def _prefer_nonzero_positive(primary, fallback):
+    """
+    Use primary if it is a valid finite positive number.
+    Otherwise use fallback if valid.
+    """
+    p = _safe_float_or_none(primary)
+    if p is not None and p > 0:
+        return p
+
+
+    f = _safe_float_or_none(fallback)
+    if f is not None:
+        return f
+
+
+    return p
+
+
+
+
+def _prefer_nonzero_int(primary, fallback):
+    p = _safe_int_or_none(primary)
+    if p is not None and p > 0:
+        return p
+
+
+    f = _safe_int_or_none(fallback)
+    if f is not None:
+        return f
+
+
+    return p
+
 
 def workspace_attribute_limits(ws: dict, name: str) -> Tuple[Optional[float], Optional[float]]:
     mins = []
@@ -528,19 +582,91 @@ def get_active_pick_count(exp: dict) -> int:
         return int(attrs.get(key) or 0) if key else 0
     except Exception:
         return 0
+        
+def get_attr_float(exp: dict, key: str) -> Optional[float]:
+    try:
+        v = nested_get(exp, "attributes", key)
+        return None if v is None else float(v)
+    except Exception:
+        return None
 
-def parse_exposure(project_dir: str, session_name: str, exp: dict, bin_size_pix: int) -> dict:
-    thumb = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "micrograph_blob_thumb", "path")
-    dw = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "micrograph_blob", "path")
-    non_dw = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "micrograph_blob_non_dw", "path")
+def get_attr_int(exp: dict, key: str) -> Optional[int]:
+    try:
+        v = nested_get(exp, "attributes", key)
+        return None if v is None else int(v)
+    except Exception:
+        return None
 
-    movie_path = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "movie_blob", "path")
+def build_exp_attr_map(exp: dict) -> dict:
+    out = {}
 
-    ctf_diag = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "ctf_stats", "diag_image_path")
-    ctf_1d = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "ctf_stats", "fit_data_path")
+    def _visit(obj):
+        if isinstance(obj, dict):
+            name = obj.get("name")
+            if name is not None and "value" in obj:
+                out[name] = obj.get("value")
+            for v in obj.values():
+                _visit(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _visit(item)
 
-    rigid_motion_path = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "rigid_motion", "path")
-    spline_motion_path = _path_from_nested_unwrap(project_dir, exp, "groups", "exposure", "spline_motion", "path")
+    _visit(exp)
+    return out
+
+
+def _unwrap_project_path(project_dir: str, maybe_path):
+    if not maybe_path:
+        return None
+    try:
+        return unwrap_project_path(project_dir, maybe_path)
+    except Exception:
+        # fall back to original helper if that's what your code expects
+        try:
+            return _path_from_nested_unwrap(project_dir, {"tmp": {"path": maybe_path}}, "tmp", "path")
+        except Exception:
+            return None
+
+def parse_exposure_light(project_dir: str, session_name: str, exp: dict) -> dict:
+    groups = exp.get("groups") or {}
+    gx = groups.get("exposure") or {}
+
+
+    micrograph_blob_thumb = gx.get("micrograph_blob_thumb") or {}
+    micrograph_blob = gx.get("micrograph_blob") or {}
+    micrograph_blob_non_dw = gx.get("micrograph_blob_non_dw") or {}
+    movie_blob = gx.get("movie_blob") or {}
+    ctf_stats = gx.get("ctf_stats") or {}
+    rigid_motion = gx.get("rigid_motion") or {}
+    spline_motion = gx.get("spline_motion") or {}
+
+    thumb = _path_from_nested_unwrap(
+        project_dir, exp, "groups", "exposure", "micrograph_blob_thumb", "path"
+    )
+    dw = _path_from_nested_unwrap(
+        project_dir, exp, "groups", "exposure", "micrograph_blob", "path"
+    )
+    non_dw = _path_from_nested_unwrap(
+        project_dir, exp, "groups", "exposure", "micrograph_blob_non_dw", "path"
+    )
+
+    movie_path = _path_from_nested_unwrap(
+        project_dir, exp, "groups", "exposure", "movie_blob", "path"
+    )
+
+    ctf_diag = _path_from_nested_unwrap(
+        project_dir, exp, "groups", "exposure", "ctf_stats", "diag_image_path"
+    )
+    ctf_1d = _path_from_nested_unwrap(
+        project_dir, exp, "groups", "exposure", "ctf_stats", "fit_data_path"
+    )
+
+    rigid_motion_path = _path_from_nested_unwrap(
+        project_dir, exp, "groups", "exposure", "rigid_motion", "path"
+    )
+    spline_motion_path = _path_from_nested_unwrap(
+        project_dir, exp, "groups", "exposure", "spline_motion", "path"
+    )
 
     micrograph_psize_A = (
         _float_from_nested_unwrap(exp, "groups", "exposure", "micrograph_blob", "psize_A")
@@ -551,27 +677,110 @@ def parse_exposure(project_dir: str, session_name: str, exp: dict, bin_size_pix:
         _int_from_nested_unwrap(exp, "groups", "exposure", "spline_motion", "frame_start")
         or _int_from_nested_unwrap(exp, "groups", "exposure", "rigid_motion", "frame_start")
     )
+
     frame_end = (
         _int_from_nested_unwrap(exp, "groups", "exposure", "spline_motion", "frame_end")
         or _int_from_nested_unwrap(exp, "groups", "exposure", "rigid_motion", "frame_end")
     )
-    
+
+
     rigid_zero_shift_frame = _int_from_nested_unwrap(
         exp, "groups", "exposure", "rigid_motion", "zero_shift_frame"
     )
-    
-    ctf_spline_path = choose_ctf_spline_path(project_dir, session_name, exp)
 
-    pick_cs, pick_picker_type = choose_pick_cs_path(project_dir, exp)
-    extracted_cs_path, extracted_cs_picker_type = choose_extracted_cs_path(project_dir, exp)
-    particle_stack, particle_picker_type = choose_extracted_stack_path(project_dir, session_name, exp, bin_size_pix)
 
     picker_type = str(exp.get("picker_type") or "").strip().lower() or None
+
+
+    accepted = is_accepted_exp(exp)
+    rejected = is_rejected_exp(exp)
+    failed = is_failed_exp(exp)
+
+
+    if accepted:
+        status_binary = 1
+    elif rejected:
+        status_binary = 0
+    else:
+        status_binary = None
+
+
+    # Legacy/helper-derived values
+    ctf_fit_A = get_ctf_fit(exp)
+    defocus_A = get_avg_defocus_A(exp)
+    defocus_um = get_avg_defocus_um(exp)
+    total_motion_pix = get_total_motion(exp)
+    max_inframe_motion = get_max_inframe_motion(exp)
+    ice_thickness_rel = get_ice_thickness_rel(exp)
+    blob_picks = get_blob_picks(exp)
+    active_pick_count = get_active_pick_count(exp)
+    extracted_particles = get_extracted_particles(exp)
+
+
+    # Canonical scatterplot keys, with fallback to legacy values
+    ctf_fit_to_A = _prefer_nonzero_positive(
+        get_attr_float(exp, "ctf_fit_to_A"),
+        ctf_fit_A,
+    )
+
+
+    average_defocus = _prefer_nonzero_positive(
+        get_attr_float(exp, "average_defocus"),
+        defocus_A,   # if your scatterplot expects µm instead, use defocus_um here
+    )
+
+
+    defocus_range = _safe_float_or_none(get_attr_float(exp, "defocus_range"))
+    astigmatism_angle = _safe_float_or_none(get_attr_float(exp, "astigmatism_angle"))
+    astigmatism = _safe_float_or_none(get_attr_float(exp, "astigmatism"))
+    phase_shift = _safe_float_or_none(get_attr_float(exp, "phase_shift"))
+
+
+    max_intra_frame_motion = _prefer_nonzero_positive(
+        get_attr_float(exp, "max_intra_frame_motion"),
+        max_inframe_motion,
+    )
+
+
+    total_motion_dist = _prefer_nonzero_positive(
+        get_attr_float(exp, "total_motion_dist"),
+        total_motion_pix,
+    )
+
+
+    df_tilt_angle = _safe_float_or_none(get_attr_float(exp, "df_tilt_angle"))
+
+
+    total_manual_picks = _safe_int_or_none(get_attr_int(exp, "total_manual_picks"))
+    total_blob_picks = _safe_int_or_none(get_attr_int(exp, "total_blob_picks"))
+    blob_pick_score_median = _safe_float_or_none(get_attr_float(exp, "blob_pick_score_median"))
+    total_template_picks = _safe_int_or_none(get_attr_int(exp, "total_template_picks"))
+    template_pick_score_median = _safe_float_or_none(get_attr_float(exp, "template_pick_score_median"))
+
+
+    total_extracted_particles = _prefer_nonzero_int(
+        get_attr_int(exp, "total_extracted_particles"),
+        extracted_particles,
+    )
+
+
+    total_extracted_particles_manual = _safe_int_or_none(
+        get_attr_int(exp, "total_extracted_particles_manual")
+    )
+    total_extracted_particles_blob = _safe_int_or_none(
+        get_attr_int(exp, "total_extracted_particles_blob")
+    )
+    total_extracted_particles_template = _safe_int_or_none(
+        get_attr_int(exp, "total_extracted_particles_template")
+    )
+
 
     return {
         "raw": exp,
         "uid": exp.get("uid"),
         "abs_file_path": exp.get("abs_file_path"),
+
+
         "movie_path": movie_path,
         "thumb_path": thumb,
         "micrograph_path": dw,
@@ -583,34 +792,95 @@ def parse_exposure(project_dir: str, session_name: str, exp: dict, bin_size_pix:
         "spline_motion_path": spline_motion_path,
         "frame_start": frame_start,
         "frame_end": frame_end,
-        "pick_cs_path": pick_cs,
-        "particle_stack_path": particle_stack,
+        "rigid_zero_shift_frame": rigid_zero_shift_frame,
+
+
+        "pick_cs_path": None,
+        "particle_stack_path": None,
+        "pick_picker_type": None,
+        "extracted_cs_path": None,
+        "extracted_cs_picker_type": None,
+        "particle_picker_type": None,
+        "ctf_spline_path": None,
         "picker_type": picker_type,
-        "pick_picker_type": pick_picker_type,
-        "extracted_cs_path": extracted_cs_path,
-        "extracted_cs_picker_type": extracted_cs_picker_type,
-        "particle_picker_type": particle_picker_type,
-        "ctf_fit_A": get_ctf_fit(exp),
-        "defocus_A": get_avg_defocus_A(exp),
-        "defocus_um": get_avg_defocus_um(exp),
-        "total_motion_pix": get_total_motion(exp),
-        "max_inframe_motion": get_max_inframe_motion(exp),
-        "ice_thickness_rel": get_ice_thickness_rel(exp),
-        "blob_picks": get_blob_picks(exp),
-        "active_pick_count": get_active_pick_count(exp),
-        "extracted_particles": get_extracted_particles(exp),
-        "accepted": is_accepted_exp(exp),
-        "rejected": is_rejected_exp(exp),
-        "failed": is_failed_exp(exp),
+
+
+        # legacy aliases
+        "ctf_fit_A": ctf_fit_A,
+        "defocus_A": defocus_A,
+        "defocus_um": defocus_um,
+        "total_motion_pix": total_motion_pix,
+        "max_inframe_motion": max_inframe_motion,
+        "ice_thickness_rel": ice_thickness_rel,
+        "blob_picks": blob_picks,
+        "active_pick_count": active_pick_count,
+        "extracted_particles": extracted_particles,
+
+
+        # canonical flattened keys
+        "ctf_fit_to_A": ctf_fit_to_A,
+        "average_defocus": average_defocus,
+        "defocus_range": defocus_range,
+        "astigmatism_angle": astigmatism_angle,
+        "astigmatism": astigmatism,
+        "phase_shift": phase_shift,
+        "max_intra_frame_motion": max_intra_frame_motion,
+        "total_motion_dist": total_motion_dist,
+        "df_tilt_angle": df_tilt_angle,
+
+
+        "total_manual_picks": total_manual_picks,
+        "total_blob_picks": total_blob_picks,
+        "blob_pick_score_median": blob_pick_score_median,
+        "total_template_picks": total_template_picks,
+        "template_pick_score_median": template_pick_score_median,
+        "total_extracted_particles": total_extracted_particles,
+        "total_extracted_particles_manual": total_extracted_particles_manual,
+        "total_extracted_particles_blob": total_extracted_particles_blob,
+        "total_extracted_particles_template": total_extracted_particles_template,
+
+
+        "accepted": accepted,
+        "rejected": rejected,
+        "failed": failed,
         "status": exposure_status_label(exp),
-        "status_binary": 1 if is_accepted_exp(exp) else 0 if is_rejected_exp(exp) else None,
+        "status_binary": status_binary,
         "start_dt": exposure_start_dt(exp),
         "end_dt": exposure_end_dt(exp),
-        "rigid_zero_shift_frame": rigid_zero_shift_frame,
-        "ctf_spline_path": ctf_spline_path,
     }
 
 
+
+
+def enrich_exposure_paths(
+    project_dir: str,
+    session_name: str,
+    exp_parsed: dict,
+    bin_size_pix: int,
+) -> dict:
+    out = dict(exp_parsed)
+    raw = out.get("raw") or {}
+
+    ctf_spline_path = choose_ctf_spline_path(project_dir, session_name, raw)
+
+    pick_cs, pick_picker_type = choose_pick_cs_path(project_dir, raw)
+    extracted_cs_path, extracted_cs_picker_type = choose_extracted_cs_path(project_dir, raw)
+    particle_stack, particle_picker_type = choose_extracted_stack_path(
+        project_dir,
+        session_name,
+        raw,
+        bin_size_pix,
+    )
+
+    out["ctf_spline_path"] = ctf_spline_path
+    out["pick_cs_path"] = pick_cs
+    out["pick_picker_type"] = pick_picker_type
+    out["extracted_cs_path"] = extracted_cs_path
+    out["extracted_cs_picker_type"] = extracted_cs_picker_type
+    out["particle_stack_path"] = particle_stack
+    out["particle_picker_type"] = particle_picker_type
+
+    return out
 
 def assign_exposure_numbers(parsed: List[dict]) -> List[dict]:
     def sort_key(e):
@@ -622,6 +892,19 @@ def assign_exposure_numbers(parsed: List[dict]) -> List[dict]:
     for i, e in enumerate(out, start=1):
         e["exposure_number"] = i
     return out
+
+def assign_elapsed_minutes(parsed: List[dict]) -> List[dict]:
+    starts = [e.get("start_dt") for e in parsed if e.get("start_dt") is not None]
+    if not starts:
+        for e in parsed:
+            e["elapsed_minutes"] = None
+        return parsed
+
+    t0 = min(starts)
+    for e in parsed:
+        dt = e.get("start_dt")
+        e["elapsed_minutes"] = None if dt is None else (dt - t0).total_seconds() / 60.0
+    return parsed
 
 def evenly_sample(items: List[Any], n: int) -> List[Any]:
     if len(items) <= n:
@@ -742,7 +1025,7 @@ def build_summary_sections(
         ("CryoSPARC Version", str(project.get("last_dumped_version", ""))),
         ("Start Time", fmt_dt(start_dt)),
         ("End Time", fmt_dt(end_dt)),
-        ("Total Time (hrs)", fmt_num(dur, 2) if dur is not None else ""),
+        ("Total Time (hrs)", fmt_num(dur, 1) if dur is not None else ""),
         ("Watch Path", str(exp_group.get("file_engine_watch_path_abs", ""))),
         ("File Filter", str(exp_group.get("file_engine_filter", ""))),
 #        ("Total Exposures Found", str(exp_group.get("num_exposures_found", stats.get("total_exposures", "")))),
@@ -774,14 +1057,14 @@ def build_summary_sections(
 #        ("Frames per Movie", str(stats.get("frames", ""))),
         ("Image Dimensions (px)", f"{stats.get('nx', '')} × {stats.get('ny', '')}"),
 #        ("Pixel Size (A/pix)", fmt_num(params.get("psize_A"), 3)),
-        ("Acceleration Voltage (kV)", fmt_num(params.get("accel_kv"), 1)),
-        ("Spherical Aberration (mm)", fmt_num(params.get("cs_mm"), 2)),
+        ("Acceleration Voltage (kV)", fmt_num(params.get("accel_kv"), 0)),
+        ("Spherical Aberration (mm)", fmt_num(params.get("cs_mm"), 1)),
 #        ("Total Dose (e/A2)", fmt_num(params.get("total_dose_e_per_A2"), 1)),
 #        ("CTF Resolution Min (Å)", fmt_num(params.get("ctf_res_min_align"), 1)),
 #        ("CTF Resolution Max (Å)", fmt_num(params.get("ctf_res_max_align"), 1)),
-        ("Best CTF Fit (Å)", fmt_num(ctf_best, 2) if ctf_best is not None else ""),
-        ("Median CTF Fit (Å)", fmt_num(ctf_med, 2) if ctf_med is not None else ""),
-        ("Worst CTF Fit (Å)", fmt_num(ctf_worst, 2) if ctf_worst is not None else ""),
+        ("Best CTF Fit (Å)", fmt_num(ctf_best, 1) if ctf_best is not None else ""),
+        ("Median CTF Fit (Å)", fmt_num(ctf_med, 1) if ctf_med is not None else ""),
+        ("Worst CTF Fit (Å)", fmt_num(ctf_worst, 1) if ctf_worst is not None else ""),
 #        ("Median Max In-Frame Motion", fmt_num(mot_med, 3) if mot_med is not None else ""),
     ]
     sections.append({
@@ -801,13 +1084,19 @@ def build_summary_sections(
     )
 
     box_size_A = fmt_num((params.get("box_size_pix")) * (params.get("psize_A")), 0)
+    bin_size_pix = params.get("bin_size_pix")
+
+    fourier_crop_html = (
+        f'&nbsp;&nbsp;&nbsp;'
+        f'<font color="#2ca25f"><b>Fourier Crop Box Size:</b> {bin_size_pix} px</font>'
+        if bin_size_pix is not None else ""
+    )
 
     picking_summary_html = (
         f'<font color="#3182bd"><b>Picker:</b> {current_picker}</font>'
         f'&nbsp;&nbsp;&nbsp;'
         f'<font color="#2ca25f"><b>Box Size:</b> {params.get("box_size_pix")} px | {box_size_A} Å</font>'
-        f'&nbsp;&nbsp;&nbsp;'
-        f'<font color="#2ca25f"><b>Fourier Crop Box Size:</b> {params.get("bin_size_pix")} px</font>'
+        f'{fourier_crop_html}'
         f'&nbsp;&nbsp;&nbsp;'
         f'<font color="#756bb1"><b>Extracted:</b> {stats.get("total_extracted_particles", "")}</font>'
         f'&nbsp;&nbsp;&nbsp;'
@@ -874,16 +1163,26 @@ def build_summary_sections(
 
     # ---------------- 2D Classification ----------------
 
-    total_2d_accepted = int(ws.get("phase2_class2D_num_particles_accepted") or 0)
-    total_2d = int(ws.get("phase2_class2D_num_particles_in") or 0)
-
     class2d_info_rows = ws.get("phase2_class2D_info") or []
+
+    total_2d_accepted = 0
     total_classified = 0
+
     for row in class2d_info_rows:
         try:
-            total_classified += int(row.get("num_particles_total") or 0)
+            num_particles_total = int(row.get("num_particles_total") or 0)
+        except Exception:
+            num_particles_total = 0
+
+        total_classified += num_particles_total
+
+        try:
+            if row.get("selected") is True:
+                total_2d_accepted += num_particles_total
         except Exception:
             pass
+
+    total_2d = int(ws.get("phase2_class2D_num_particles_in") or 0)
 
     class2d_summary_html = (
         f'<font color="#3182bd"><b>Classes:</b> {class2d["total_classes"]}</font>'
@@ -892,13 +1191,13 @@ def build_summary_sections(
         f'&nbsp;&nbsp;&nbsp;'
         f'<font color="#de2d26"><b>Rejected:</b> {class2d["rejected_classes"]}</font>'
         f'&nbsp;&nbsp;&nbsp;'
-        f'<font color="#756bb1"><b>Particles Accepted:</b> {ws.get("phase2_class2D_num_particles_accepted", "")}</font>'
+        f'<font color="#756bb1"><b>Particles Accepted:</b> {total_2d_accepted}</font>'
         f'&nbsp;&nbsp;&nbsp;'
         f'<font color="#dd1c77"><b>Acceptance:</b> {fmt_pct(total_2d_accepted, total_classified, 0)}</font>'
     )
-    
+
     class2d_rows = [
-#        ("Selected 2D Class Job", class_job_uid or ""),
+    #    ("Selected 2D Class Job", class_job_uid or ""),
         ("2D Class Max Resolution (A)", fmt_num(get_class2d_param(class_job_uid, ws, "class2D_max_res"), 1)),
     ]
 
@@ -909,15 +1208,15 @@ def build_summary_sections(
     class2d_rows.extend([
         ("2D Window Inner (A)", fmt_num(window_inner_A, 1)),
         ("Particles Classified", str(total_classified)),
-#        ("2D Particles Accepted", str(ws.get("phase2_class2D_num_particles_accepted", ""))),
-#        ("2D Particles Rejected", str(ws.get("phase2_class2D_num_particles_rejected", ""))),
+        ("2D Particles Accepted", str(total_2d_accepted)),
+    #    ("2D Particles Rejected", str(ws.get("phase2_class2D_num_particles_rejected", ""))),
         ("2D Last Updated", fmt_dt(json_date_to_dt(ws.get("phase2_class2D_last_updated")))),
-#        ("2D Class K", str(nested_get(ws, "phase2_class2D_params_spec_used", "class2D_K") or "")),
-#        ("2D Classes Total", str(class2d["total_classes"])),
-#        ("2D Classes Selected", str(class2d["selected_classes"])),
-#        ("2D Classes Rejected", str(class2d["rejected_classes"])),
-#        ("2D Particles in Selected Classes", str(class2d["selected_particles"])),
-#        ("2D Particles in Rejected Classes", str(class2d["rejected_particles"])),
+    #    ("2D Class K", str(nested_get(ws, "phase2_class2D_params_spec_used", "class2D_K") or "")),
+    #    ("2D Classes Total", str(class2d["total_classes"])),
+    #    ("2D Classes Selected", str(class2d["selected_classes"])),
+    #    ("2D Classes Rejected", str(class2d["rejected_classes"])),
+    #    ("2D Particles in Selected Classes", str(class2d["selected_particles"])),
+    #    ("2D Particles in Rejected Classes", str(class2d["rejected_particles"])),
     ])
 
     sections.append({
