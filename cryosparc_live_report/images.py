@@ -240,23 +240,27 @@ def render_text_crop(text, font, fg=(0, 0, 0), bg=(255, 255, 255), pad=12, out_p
 
     return tmp.crop((x0, y0, x1, y1))
 
+
 def mplfig_to_pil(fig) -> Image.Image:
     buf = io.BytesIO()
-    fig.savefig(
-        buf,
-        format="png",
-        dpi=100,
-        facecolor="white",
-        edgecolor="none",
-        bbox_inches=None,
-        pad_inches=0.0,
-    )
-    plt.close(fig)
-    buf.seek(0)
-    img = Image.open(buf).convert("RGB")
-    img.load()
-    buf.close()
-    return img
+    try:
+        with np.errstate(over="ignore"):
+            fig.savefig(
+                buf,
+                format="png",
+                dpi=100,
+                facecolor="white",
+                edgecolor="none",
+                bbox_inches=None,
+                pad_inches=0.0,
+            )
+        buf.seek(0)
+        img = Image.open(buf).convert("RGB")
+        img.load()
+        return img
+    finally:
+        buf.close()
+        plt.close(fig)
 
 
 def sample_indices_evenly(n: int, sample_n: int) -> List[int]:
@@ -1070,6 +1074,7 @@ def overlay_blob_picks(
             )
 
         out = Image.alpha_composite(img, overlay)
+        out = out.transpose(Image.FLIP_TOP_BOTTOM)
         return out.convert("RGB")
 
     except Exception:
@@ -1811,7 +1816,6 @@ def plot_ctf_defocus_landscape_to_pil(
             cbar.ax.tick_params(labelsize=cfg["tick_labelsize"])
             cbar.set_label(cfg["colorbar_label"], fontsize=cfg["colorbar_label_fontsize"])
 
-        fig.tight_layout(pad=cfg["tight_pad"])
         return mplfig_to_pil(fig)
 
     except Exception as e:

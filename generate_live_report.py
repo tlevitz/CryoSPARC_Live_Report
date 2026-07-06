@@ -1534,8 +1534,8 @@ def build_report(
 
 
         optimize_pdf_with_ghostscript(pdf_path, dpi=600, replace_original=True)
+        os.chmod(pdf_path, 0o777)
         print(f"Wrote: {pdf_name}")
-
 
     except Exception as e:
         print(f"Error: failed while writing PDF: {e}")

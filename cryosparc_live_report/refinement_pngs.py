@@ -847,9 +847,14 @@ def _render_surface_panel_image(tri_verts, normals, azim, elev, lim, panel_px, d
     ax.set_axis_off()
 
 
-    fig.canvas.draw()
-    img = np.asarray(fig.canvas.buffer_rgba()).copy()
-    plt.close(fig)
+    try:
+        with np.errstate(over="ignore"):
+            fig.canvas.draw()
+        img = np.asarray(fig.canvas.buffer_rgba()).copy()
+    finally:
+        plt.close(fig)
+
+
     return img
 
 
@@ -2781,4 +2786,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
