@@ -45,7 +45,8 @@ _Notes_
 1. If no 2D classification, ab-initio, or homogeneous refinement jobs were run during the Live session, those segments will automatically be omitted from the report
 2. If the raw data have been moved or deleted since the session was created, or if metadata information (.xml or .mdoc) files are not in the same folder as the micrographs, the positional information plots will not be able to be generated and will automatically be omitted from the report. The script can resolve symlinks, so as long as the true files are in their original directory structure as written by SerialEM or EPU, it should be able to find the positional information.
 3. These files are meant to be viewed on a computer/tablet with zoom, and some plots may be too small for printing. The final resolution of the PDF is a balance between readability, speed, size, and quality, and should zoom sufficiently for quality assessment purposes.
-4. These scripts were generated with the assistance of GPT4DFCI, a private, HIPAA-secure endpoint to GPT-4o provided by DFCI
+4. The script should take around 1-5 minutes to run on a standard Linux box; multithreading is not enabled at this point
+5. These scripts were generated with the assistance of GPT4DFCI, a private, HIPAA-secure endpoint to GPT-4o provided by DFCI
 
 ## Example Report
 <img width="678" height="876" alt="image" src="https://github.com/user-attachments/assets/32826bbf-16b3-4c6c-887e-ff7e1322a58d" />
