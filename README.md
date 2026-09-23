@@ -10,7 +10,7 @@ This script requires that you have conda installed, and that you have write and 
 git clone https://github.com/tlevitz/CryoSPARC_Live_Report.git /path/to/your/scripts/folder
 ```
 
-2. Create a live_report conda environment
+2. Create a live_report conda environment from the environment.yml file
 ```bash
 conda env create -f environment.yml
 ```
